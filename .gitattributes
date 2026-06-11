@@ -1,0 +1,7 @@
+# Os pesos da rede (~245 MB) excedem o limite de 100 MB por arquivo do GitHub.
+# Versione-os com Git LFS:  git lfs install && git lfs track "*.weights"
+*.weights filter=lfs diff=lfs merge=lfs -text
+# Normalização de fim de linha
+*.py text eol=lf
+Dockerfile text eol=lf
+*.yml text eol=lf

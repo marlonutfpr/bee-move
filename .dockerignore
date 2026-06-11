@@ -1,0 +1,24 @@
+# Dados de runtime (no container ficam em volumes)
+data/
+logs/
+
+# Vídeos e arquivos grandes que não pertencem à imagem
+*.mp4
+*.avi
+*.mov
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Git / docs / IDE
+.git/
+.gitignore
+.gitattributes
+docs/
+*.md
+.vscode/
+.idea/

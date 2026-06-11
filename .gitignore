@@ -1,0 +1,31 @@
+# Banco de dados e logs gerados em runtime
+data/
+logs/
+*.db
+*.db-wal
+*.db-shm
+
+# Vídeos e arquivos grandes (NÃO versionar)
+*.mp4
+*.avi
+*.mov
+*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Sistema operacional / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Artefatos de empacotamento
+build/
+dist/
+*.spec

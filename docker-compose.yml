@@ -1,0 +1,49 @@
+# Uso:
+#   CPU: docker compose --profile cpu up --build
+#   GPU: docker compose --profile gpu up --build
+#        (requer driver NVIDIA + NVIDIA Container Toolkit no host)
+#
+# Os volumes bee-data (banco SQLite) e bee-logs (arquivos de log) são
+# compartilhados entre os perfis — trocar de CPU para GPU mantém usuários,
+# análises e histórico.
+services:
+  bee-tracker-cpu:
+    profiles: ["cpu"]
+    build:
+      context: .
+      target: cpu
+    image: bee-tracker:cpu
+    ports:
+      - "8501:8501"
+    volumes:
+      - bee-data:/app/data
+      - bee-logs:/app/logs
+    restart: unless-stopped
+
+  bee-tracker-gpu:
+    profiles: ["gpu"]
+    build:
+      context: .
+      target: gpu
+      # Use a compute capability da SUA GPU (nvidia-smi --query-gpu=compute_cap
+      # --format=csv) — valor errado faz o app cair para CPU em runtime:
+      args:
+        CUDA_ARCH_BIN: "7.5"   # RTX 2070 SUPER (6.1 = GTX 10xx, 8.6 = RTX 30xx, 8.9 = RTX 40xx)
+    image: bee-tracker:gpu
+    ports:
+      - "8501:8501"
+    volumes:
+      - bee-data:/app/data
+      - bee-logs:/app/logs
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  bee-data:
+  bee-logs:

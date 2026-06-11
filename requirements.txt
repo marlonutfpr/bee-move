@@ -1,0 +1,11 @@
+# Dependências comuns (CPU e GPU).
+# OpenCV NÃO está aqui de propósito:
+#   - imagem CPU: instala opencv-python-headless via pip (ver Dockerfile)
+#   - imagem GPU: usa OpenCV compilado com CUDA dentro da própria imagem
+streamlit>=1.35
+numpy>=1.26
+pandas>=2.0
+matplotlib>=3.8
+seaborn>=0.13
+pillow>=10.0                     # frame de fundo da calibração de escala
+streamlit-drawable-canvas>=0.9.3  # desenho da linha de calibração px->mm
