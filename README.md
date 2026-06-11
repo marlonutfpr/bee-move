@@ -6,6 +6,39 @@ Gera mapa de calor, trajetória, métricas de movimento e um **relatório PDF**
 consolidado. Inclui **contas de usuário** com histórico isolado por conta,
 persistência em **SQLite** e **log estruturado** de eventos.
 
+> 📄 Este projeto está associado ao artigo científico **"Analyzing Bee Behavior
+> Through Video Tracking Using Computer Vision Techniques"** — veja
+> [Publicação e citação](#-publicação-e-citação).
+
+## 📄 Publicação e citação
+
+Este trabalho foi publicado na **Revista de Informática Teórica e Aplicada (RITA)**:
+
+> **Analyzing Bee Behavior Through Video Tracking Using Computer Vision Techniques**
+> Ian Carlos Rocha Lima, André Roberto Ortoncelli, Michele Potrich, Marlon Marcon.
+> *Revista de Informática Teórica e Aplicada (RITA)*, v. 32, n. 1, p. 280–286, 2025.
+> Universidade Tecnológica Federal do Paraná (UTFPR).
+
+- 🔗 Artigo: <https://seer.ufrgs.br/index.php/rita/article/view/143502>
+- 🔗 DOI: <https://doi.org/10.22456/2175-2745.143502>
+- 🏷️ Palavras-chave: *Insect Detection, Object Detection, Heat Maps, Walk Path Analysis*
+
+Se você usar este software ou as ideias do trabalho, por favor cite:
+
+```bibtex
+@article{lima2025bee,
+  title   = {Analyzing Bee Behavior Through Video Tracking Using Computer Vision Techniques},
+  author  = {Lima, Ian Carlos Rocha and Ortoncelli, Andr\'e Roberto and Potrich, Michele and Marcon, Marlon},
+  journal = {Revista de Inform\'atica Te\'orica e Aplicada (RITA)},
+  volume  = {32},
+  number  = {1},
+  pages   = {280--286},
+  year    = {2025},
+  doi     = {10.22456/2175-2745.143502},
+  url     = {https://seer.ufrgs.br/index.php/rita/article/view/143502}
+}
+```
+
 ## Funcionalidades
 
 - **Detecção/rastreamento** YOLOv4 com pós-processamento em C++ (`cv2.dnn_DetectionModel`) e leitura de vídeo em thread separada.
@@ -98,3 +131,8 @@ streamlit run src/bee_tracker.py
 | `BEE_DB_PATH` | `data/bee_tracker.db` | Caminho do banco SQLite |
 | `BEE_LOG_DIR` | `logs` | Diretório dos arquivos de log |
 | `STREAMLIT_SERVER_MAX_UPLOAD_SIZE` | `3000` | Tamanho máx. de upload (MB) |
+
+## Autores
+
+Ian Carlos Rocha Lima · André Roberto Ortoncelli · Michele Potrich · Marlon Marcon
+— Universidade Tecnológica Federal do Paraná (UTFPR).
