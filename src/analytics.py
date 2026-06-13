@@ -17,6 +17,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
+from matplotlib.path import Path as MplPath
 import seaborn as sns
 
 MAX_KDE_POINTS = 2000  # subamostra os centróides p/ o KDE não dominar o plot
@@ -130,6 +131,179 @@ def calcular_metricas(centroides, indices, fps_video, limiar_parada_px,
     return m
 
 
+# --- Múltiplas placas/abelhas (tracks) ---
+
+def tracks_unicos(track_ids, centroides=None):
+    """IDs de track presentes (ou [0] quando há um único alvo / sem track_ids)."""
+    if track_ids is None:
+        return [0]
+    tids = np.asarray(track_ids).reshape(-1)
+    if len(tids) == 0:
+        return [0]
+    return sorted(int(t) for t in np.unique(tids))
+
+
+def subset_track(centroides, indices, track_ids, t):
+    """Recorta os pontos de um único track (placa/abelha)."""
+    centroides = np.asarray(centroides, float).reshape(-1, 2)
+    indices = np.asarray(indices).reshape(-1)
+    if track_ids is None or len(np.asarray(track_ids).reshape(-1)) == 0:
+        return centroides, indices
+    mask = np.asarray(track_ids).reshape(-1) == t
+    return centroides[mask], indices[mask]
+
+
+def plot_trajetorias_multi(centroides, indices, track_ids, fundo, fps_video,
+                           zones=None, rotulos=None):
+    """Trajetória de cada placa/abelha numa cor diferente, sobre o frame.
+
+    `rotulos` é um dict opcional {track_id: nome} (ex.: nomes das áreas).
+    """
+    fig, ax = _figura_sobre_fundo(fundo)
+    cores = plt.cm.tab10(np.linspace(0, 1, 10))
+    for i, t in enumerate(tracks_unicos(track_ids)):
+        c, _ = subset_track(centroides, indices, track_ids, t)
+        if len(c) == 0:
+            continue
+        cor = cores[i % 10]
+        rotulo = (rotulos or {}).get(t, f"Abelha {t + 1}")
+        ax.plot(c[:, 0], c[:, 1], "-", color=cor, linewidth=1.2, alpha=0.85,
+                marker="o", markersize=2, label=rotulo)
+        ax.plot(*c[0], "o", color=cor, markersize=8, markeredgecolor="black")
+    if zones:
+        _desenhar_zonas(ax, zones)
+    ax.set_title("Trajetórias por placa")
+    ax.legend(loc="upper right", fontsize=8)
+    fig.tight_layout()
+    return fig
+
+
+# --- Áreas de monitoramento (zonas) ---
+
+def pontos_em_zona(centroides, poligono):
+    """Máscara booleana (N,) indicando quais centróides estão dentro do polígono."""
+    centroides = np.asarray(centroides, float).reshape(-1, 2)
+    poligono = np.asarray(poligono, float).reshape(-1, 2)
+    if len(poligono) < 3 or len(centroides) == 0:
+        return np.zeros(len(centroides), dtype=bool)
+    return MplPath(poligono).contains_points(centroides)
+
+
+def _area_poligono_px2(poligono):
+    """Área do polígono em px² (fórmula do shoelace)."""
+    p = np.asarray(poligono, float).reshape(-1, 2)
+    if len(p) < 3:
+        return 0.0
+    x, y = p[:, 0], p[:, 1]
+    return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+
+def metricas_por_zona(centroides, indices, fps_video, zones,
+                      frame_skip=None, pixels_per_mm=None) -> list:
+    """Métricas de presença/permanência da abelha em cada área demarcada.
+
+    Para cada zona: nº de detecções dentro, % das detecções, nº de visitas
+    (entradas), distância percorrida dentro, tempo de permanência (se houver
+    fps + frame_skip) e área da zona. Inclui conversão para mm se calibrado.
+    """
+    centroides = np.asarray(centroides, float).reshape(-1, 2)
+    n = len(centroides)
+    usa_segundos = bool(fps_video and fps_video > 0)
+    dt_amostra = (frame_skip / fps_video) if (frame_skip and usa_segundos) else None
+    passo = (np.hypot(*np.diff(centroides, axis=0).T) if n >= 2
+             else np.zeros(0))
+
+    resultados = []
+    for i, z in enumerate(zones or []):
+        nome = z.get("name") or f"Área {i + 1}"
+        poly = z.get("points") or []
+        dentro = pontos_em_zona(centroides, poly)
+        n_dentro = int(dentro.sum())
+        # visitas = transições de fora -> dentro
+        anterior = np.concatenate([[False], dentro[:-1]]) if n else np.zeros(0, bool)
+        visitas = int(np.sum(dentro & ~anterior)) if n else 0
+        # distância percorrida cujo passo começa dentro da zona
+        dist_px = float(passo[dentro[:-1]].sum()) if n >= 2 else 0.0
+        area_px2 = _area_poligono_px2(poly)
+
+        r = {
+            "nome": nome,
+            "deteccoes_dentro": n_dentro,
+            "perc_deteccoes": 100 * n_dentro / n if n else 0.0,
+            "visitas": visitas,
+            "distancia_dentro_px": dist_px,
+            "area_px2": area_px2,
+            "unidade_t": "s" if usa_segundos else "frames",
+        }
+        if dt_amostra is not None:
+            r["tempo_permanencia"] = n_dentro * dt_amostra
+        if pixels_per_mm and pixels_per_mm > 0:
+            r["distancia_dentro_mm"] = dist_px / pixels_per_mm
+            r["area_mm2"] = area_px2 / (pixels_per_mm ** 2)
+        resultados.append(r)
+    return resultados
+
+
+def _desenhar_zonas(ax, zones):
+    """Sobrepõe os polígonos das zonas (com rótulo) sobre um eixo já montado."""
+    cores = plt.cm.tab10(np.linspace(0, 1, 10))
+    for i, z in enumerate(zones or []):
+        poly = np.asarray(z.get("points") or [], float).reshape(-1, 2)
+        if len(poly) < 3:
+            continue
+        cor = cores[i % 10]
+        fechado = np.vstack([poly, poly[0]])
+        ax.plot(fechado[:, 0], fechado[:, 1], "-", color=cor, linewidth=2,
+                label=z.get("name") or f"Área {i + 1}")
+        ax.fill(poly[:, 0], poly[:, 1], color=cor, alpha=0.12)
+        cx, cy = poly[:, 0].mean(), poly[:, 1].mean()
+        ax.text(cx, cy, z.get("name") or f"Área {i + 1}", color="white",
+                fontsize=8, ha="center", va="center", weight="bold",
+                bbox=dict(boxstyle="round,pad=0.2", fc=cor, ec="none", alpha=0.85))
+
+
+def plot_mapa_zonas(centroides, fundo, zones):
+    """Frame com as áreas demarcadas e os pontos visitados (verificação visual)."""
+    if not zones:
+        return None
+    fig, ax = _figura_sobre_fundo(fundo)
+    centroides = np.asarray(centroides, float).reshape(-1, 2)
+    if len(centroides):
+        ax.scatter(centroides[:, 0], centroides[:, 1], s=6, c="white",
+                   alpha=0.35, zorder=1)
+    _desenhar_zonas(ax, zones)
+    ax.set_title("Áreas de monitoramento")
+    ax.legend(loc="upper right", fontsize=8)
+    fig.tight_layout()
+    return fig
+
+
+def plot_permanencia_zonas(metricas_zonas):
+    """Gráfico de barras: tempo (ou % de detecções) de permanência por área."""
+    if not metricas_zonas:
+        return None
+    nomes = [m["nome"] for m in metricas_zonas]
+    tem_tempo = all("tempo_permanencia" in m for m in metricas_zonas)
+    if tem_tempo:
+        valores = [m["tempo_permanencia"] for m in metricas_zonas]
+        xlabel, fmt = "Permanência (s)", "{:.1f}"
+    else:
+        valores = [m["perc_deteccoes"] for m in metricas_zonas]
+        xlabel, fmt = "Permanência (% das detecções)", "{:.1f}%"
+
+    fig, ax = plt.subplots(figsize=(7, max(2.5, 0.6 * len(nomes) + 1)))
+    cores = plt.cm.tab10(np.linspace(0, 1, 10))[:len(nomes)]
+    ax.barh(nomes, valores, color=cores)
+    ax.invert_yaxis()
+    ax.set_xlabel(xlabel)
+    ax.set_title("Permanência por área")
+    for i, v in enumerate(valores):
+        ax.text(v, i, " " + fmt.format(v), va="center", fontsize=9)
+    ax.grid(axis="x", alpha=0.3)
+    fig.tight_layout()
+    return fig
+
+
 # --- Gráficos sobre o frame do vídeo ---
 
 def _figura_sobre_fundo(fundo):
@@ -144,7 +318,7 @@ def _figura_sobre_fundo(fundo):
     return fig, ax
 
 
-def plot_trajetoria_tempo(centroides, indices, fundo, fps_video):
+def plot_trajetoria_tempo(centroides, indices, fundo, fps_video, zones=None):
     """Caminho colorido pelo tempo (azul→amarelo = início→fim)."""
     centroides = np.asarray(centroides, float).reshape(-1, 2)
     if len(centroides) < 2:
@@ -164,13 +338,15 @@ def plot_trajetoria_tempo(centroides, indices, fundo, fps_video):
             markeredgecolor="black", label="Início")
     ax.plot(*centroides[-1], "s", color="red", markersize=10,
             markeredgecolor="black", label="Fim")
+    if zones:
+        _desenhar_zonas(ax, zones)
     ax.set_title("Trajetória ao longo do tempo")
-    ax.legend(loc="upper right")
+    ax.legend(loc="upper right", fontsize=8)
     fig.tight_layout()
     return fig
 
 
-def plot_heatmap(centroides, fundo):
+def plot_heatmap(centroides, fundo, zones=None):
     """Mapa de calor (densidade de permanência) via KDE."""
     centroides = np.asarray(centroides, float).reshape(-1, 2)
     if len(centroides) < 2:
@@ -188,6 +364,9 @@ def plot_heatmap(centroides, fundo):
     except Exception:
         plt.close(fig)
         return None
+    if zones:
+        _desenhar_zonas(ax, zones)
+        ax.legend(loc="upper right", fontsize=8)
     ax.set_title("Mapa de calor das visitas")
     fig.tight_layout()
     return fig

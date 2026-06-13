@@ -7,6 +7,7 @@ analytics). Função pura: recebe a lista de análises completas e devolve bytes
 """
 
 import io
+import json
 from datetime import datetime
 
 import cv2
@@ -88,6 +89,33 @@ def _linhas_metricas(m):
     return linhas
 
 
+def _parse_zones(valor):
+    if not valor:
+        return None
+    try:
+        zonas = json.loads(valor)
+        return zonas if zonas else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _linhas_zonas(metricas_zonas):
+    linhas = []
+    for m in metricas_zonas:
+        ut = m.get("unidade_t", "s")
+        linhas.append(f"• {m['nome']}")
+        linhas.append(f"    Detecções dentro ..... {m['deteccoes_dentro']} "
+                      f"({m['perc_deteccoes']:.1f}%)")
+        if "tempo_permanencia" in m:
+            linhas.append(f"    Permanência .......... {m['tempo_permanencia']:.1f} {ut}")
+        linhas.append(f"    Visitas (entradas) ... {m['visitas']}")
+        linhas.append(f"    Distância dentro ..... {m['distancia_dentro_px']:.0f} px"
+                      + (f" / {m['distancia_dentro_mm']:.1f} mm"
+                         if "distancia_dentro_mm" in m else ""))
+        linhas.append("")
+    return linhas
+
+
 def _pagina_resumo(pdf, analises):
     fig = plt.figure(figsize=A4)
     fig.text(0.5, 0.95, "Resumo das análises", ha="center", fontsize=16, weight="bold")
@@ -138,24 +166,82 @@ def build_pdf(analises_completas, username, limiar_parada_px=3.0) -> bytes:
             indices = analytics_blob(a, "frame_indices")
             if centroides is None or len(centroides) == 0:
                 continue
+            track_ids = analytics_blob(a, "track_ids")
             fundo = _fundo(a)
-            m = analytics.calcular_metricas(
-                centroides, indices, a.get("fps_video"), limiar_parada_px,
-                frame_shape=fundo.shape if fundo is not None else None,
-                frames_processados=a.get("frames_processed"),
-                frame_skip=a.get("frame_skip"),
-                pixels_per_mm=a.get("pixels_per_mm"),
-            )
-            _pagina_texto(
-                pdf, f"Análise #{a.get('id')} — {a.get('video_name')}",
-                _linhas_metricas(m),
-                subtitulo=f"Processada em {(a.get('created_at') or '')[:19]}",
-            )
-            if fundo is not None:
-                _adicionar_figura(
-                    pdf, analytics.plot_trajetoria_tempo(
-                        centroides, indices, fundo, a.get("fps_video")))
-                _adicionar_figura(pdf, analytics.plot_heatmap(centroides, fundo))
+            zones = _parse_zones(a.get("zones"))
+            fps = a.get("fps_video")
+            tids = analytics.tracks_unicos(track_ids, centroides)
+
+            if len(tids) > 1:
+                # Visão geral multi-placa
+                linhas = [f"{len(tids)} placas/abelhas rastreadas", ""]
+                for t in tids:
+                    c, idx = analytics.subset_track(centroides, indices, track_ids, t)
+                    mt = analytics.calcular_metricas(
+                        c, idx, fps, limiar_parada_px,
+                        frame_shape=fundo.shape if fundo is not None else None,
+                        frames_processados=a.get("frames_processed"),
+                        frame_skip=a.get("frame_skip"),
+                        pixels_per_mm=a.get("pixels_per_mm"))
+                    linhas.append(
+                        f"Abelha {t + 1}: {mt.get('deteccoes', 0)} det · "
+                        f"{mt.get('distancia_px', 0):.0f} px · "
+                        f"{mt.get('velocidade_media', 0):.1f} {mt.get('unidade_v', 'px/s')}")
+                _pagina_texto(
+                    pdf, f"Análise #{a.get('id')} — {a.get('video_name')}",
+                    linhas, subtitulo=f"Processada em {(a.get('created_at') or '')[:19]}")
+                if fundo is not None:
+                    _adicionar_figura(pdf, analytics.plot_trajetorias_multi(
+                        centroides, indices, track_ids, fundo, fps, zones=zones))
+                # Uma seção de métricas + trajetória por placa
+                for t in tids:
+                    c, idx = analytics.subset_track(centroides, indices, track_ids, t)
+                    mt = analytics.calcular_metricas(
+                        c, idx, fps, limiar_parada_px,
+                        frame_shape=fundo.shape if fundo is not None else None,
+                        frames_processados=a.get("frames_processed"),
+                        frame_skip=a.get("frame_skip"),
+                        pixels_per_mm=a.get("pixels_per_mm"))
+                    _pagina_texto(pdf, f"Abelha {t + 1} — Análise #{a.get('id')}",
+                                  _linhas_metricas(mt))
+                    if fundo is not None:
+                        _adicionar_figura(pdf, analytics.plot_trajetoria_tempo(
+                            c, idx, fundo, fps, zones=zones))
+            else:
+                m = analytics.calcular_metricas(
+                    centroides, indices, fps, limiar_parada_px,
+                    frame_shape=fundo.shape if fundo is not None else None,
+                    frames_processados=a.get("frames_processed"),
+                    frame_skip=a.get("frame_skip"),
+                    pixels_per_mm=a.get("pixels_per_mm"),
+                )
+                _pagina_texto(
+                    pdf, f"Análise #{a.get('id')} — {a.get('video_name')}",
+                    _linhas_metricas(m),
+                    subtitulo=f"Processada em {(a.get('created_at') or '')[:19]}",
+                )
+                if fundo is not None:
+                    _adicionar_figura(
+                        pdf, analytics.plot_trajetoria_tempo(
+                            centroides, indices, fundo, fps, zones=zones))
+                    _adicionar_figura(pdf, analytics.plot_heatmap(centroides, fundo,
+                                                                  zones=zones))
+
+            # Seção de áreas de monitoramento (presença agregada de todas as placas)
+            if zones:
+                mz = analytics.metricas_por_zona(
+                    centroides, indices, fps, zones,
+                    a.get("frame_skip"), a.get("pixels_per_mm"),
+                )
+                _pagina_texto(
+                    pdf, f"Áreas de monitoramento — Análise #{a.get('id')}",
+                    _linhas_zonas(mz),
+                    subtitulo=f"{len(zones)} área(s) demarcada(s)",
+                )
+                if fundo is not None:
+                    _adicionar_figura(pdf, analytics.plot_mapa_zonas(
+                        centroides, fundo, zones))
+                    _adicionar_figura(pdf, analytics.plot_permanencia_zonas(mz))
 
         d = pdf.infodict()
         d["Title"] = f"Relatório Bee Tracker — {username}"

@@ -42,8 +42,10 @@ Se você usar este software ou as ideias do trabalho, por favor cite:
 ## Funcionalidades
 
 - **Detecção/rastreamento** YOLOv4 com pós-processamento em C++ (`cv2.dnn_DetectionModel`) e leitura de vídeo em thread separada.
+- **Múltiplas placas por vídeo**: informe quantas placas (abelhas) há por frame e o app mantém as N detecções de maior confiança, rastreando cada placa separadamente (atribuição pelo vizinho mais próximo) — com métricas, trajetórias e relatório por placa.
 - **GPU CUDA (com FP16) e fallback automático para CPU** — a mesma imagem roda nos dois modos.
 - **Calibração de escala px → mm** desenhando uma linha sobre um objeto de medida conhecida → métricas em milímetros.
+- **Áreas de monitoramento (polígonos ou círculos)**: o usuário demarca regiões no frame e o app calcula presença/permanência por área — nº de detecções, % do tempo, visitas (entradas) e distância percorrida dentro de cada área — além dos dados globais, tudo refletido nos gráficos e no relatório. Quando há áreas definidas, **cada área é tratada como uma placa** (uma abelha por área) e detecções fora de todas as áreas são **descartadas como falso positivo**.
 - **Análises**: distância, deslocamento líquido, retilineidade, velocidade média/máxima, tempo em movimento/parado, tempo detectado/não detectado, área explorada (envoltória convexa) e cobertura do quadro.
 - **Gráficos**: trajetória colorida pelo tempo, mapa de calor (KDE), velocidade no tempo, distância acumulada, histograma de velocidades, posição X/Y.
 - **Usuários e histórico**: login (senha PBKDF2), cada usuário vê apenas as próprias análises; reabrir uma análise antiga não reprocessa o vídeo.
@@ -62,21 +64,13 @@ bee-tracker/
 │   └── app_logging.py       # Log em arquivo rotativo + tabela `logs`
 ├── models/                  # Rede neural
 │   ├── yolov4-tcc.cfg
-│   ├── yolov4-tcc_best.weights   # (~245 MB — via Git LFS)
+│   ├── yolov4-tcc_best.weights   # (~245 MB)
 │   └── coco.names
 ├── Dockerfile               # Build CPU (padrão) ou GPU (CUDA)
 ├── docker-compose.yml
 ├── requirements.txt
 └── README.md
 ```
-
-> ⚠️ **Pesos via Git LFS** — `yolov4-tcc_best.weights` tem ~245 MB e excede o
-> limite de 100 MB por arquivo do GitHub. Antes do primeiro push:
-> ```bash
-> git lfs install
-> git lfs track "*.weights"
-> git add .gitattributes
-> ```
 
 ## Rodando com Docker
 

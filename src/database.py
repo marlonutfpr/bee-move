@@ -47,9 +47,12 @@ CREATE TABLE IF NOT EXISTS analyses (
     processing_time_s REAL,
     fps_processing    REAL,
     pixels_per_mm     REAL,  -- escala de calibração (0/NULL = não calibrado)
+    zones             TEXT,  -- JSON: áreas de monitoramento [{name, points}]
+    num_targets       INTEGER,  -- nº de placas/abelhas rastreadas (1 = single)
     -- dados brutos para re-renderizar gráficos e exportar CSV
-    centroids         BLOB,  -- np.save de array (N, 2)
-    frame_indices     BLOB,  -- np.save de array (N,)
+    centroids         BLOB,  -- np.save de array (M, 2)
+    frame_indices     BLOB,  -- np.save de array (M,)
+    track_ids         BLOB,  -- np.save de array (M,) — placa de cada centróide
     first_frame_jpg   BLOB   -- primeiro frame comprimido em JPEG
 );
 
@@ -105,6 +108,12 @@ def _migrate(conn):
     colunas = {r["name"] for r in conn.execute("PRAGMA table_info(analyses)")}
     if "pixels_per_mm" not in colunas:
         conn.execute("ALTER TABLE analyses ADD COLUMN pixels_per_mm REAL")
+    if "zones" not in colunas:
+        conn.execute("ALTER TABLE analyses ADD COLUMN zones TEXT")
+    if "num_targets" not in colunas:
+        conn.execute("ALTER TABLE analyses ADD COLUMN num_targets INTEGER")
+    if "track_ids" not in colunas:
+        conn.execute("ALTER TABLE analyses ADD COLUMN track_ids BLOB")
 
 
 # --- Serialização de arrays ---
@@ -157,7 +166,8 @@ def touch_last_login(user_id: int):
 def save_analysis(user_id: int, video_name: str, video_size_bytes: int,
                   params: dict, metrics: dict,
                   centroids_blob: bytes, frame_indices_blob: bytes,
-                  first_frame_jpg: bytes | None) -> int:
+                  first_frame_jpg: bytes | None,
+                  track_ids_blob: bytes | None = None) -> int:
     with get_conn() as conn:
         cur = conn.execute(
             """INSERT INTO analyses (
@@ -165,9 +175,9 @@ def save_analysis(user_id: int, video_name: str, video_size_bytes: int,
                    frame_skip, input_size, conf_threshold, nms_threshold, backend,
                    fps_video, total_frames, frames_processed, detections,
                    distance_px, avg_speed_px_s, processing_time_s, fps_processing,
-                   pixels_per_mm,
-                   centroids, frame_indices, first_frame_jpg
-               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   pixels_per_mm, zones, num_targets,
+                   centroids, frame_indices, track_ids, first_frame_jpg
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 user_id, video_name, video_size_bytes,
                 params.get("frame_skip"), params.get("input_size"),
@@ -176,8 +186,9 @@ def save_analysis(user_id: int, video_name: str, video_size_bytes: int,
                 metrics.get("frames_processed"), metrics.get("detections"),
                 metrics.get("distance_px"), metrics.get("avg_speed_px_s"),
                 metrics.get("processing_time_s"), metrics.get("fps_processing"),
-                params.get("pixels_per_mm"),
-                centroids_blob, frame_indices_blob, first_frame_jpg,
+                params.get("pixels_per_mm"), params.get("zones"),
+                metrics.get("num_targets"),
+                centroids_blob, frame_indices_blob, track_ids_blob, first_frame_jpg,
             ),
         )
         return cur.lastrowid
