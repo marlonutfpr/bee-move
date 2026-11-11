@@ -94,6 +94,7 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 
 COPY src/ ./src/
 COPY models/ ./models/
+COPY .streamlit/ ./.streamlit/
 
 # Banco SQLite e logs — monte volumes nesses caminhos para persistir os dados
 RUN mkdir -p /app/data /app/logs
@@ -129,6 +130,7 @@ RUN pip install --no-cache-dir -r requirements.txt opencv-python-headless
 
 COPY src/ ./src/
 COPY models/ ./models/
+COPY .streamlit/ ./.streamlit/
 
 # Banco SQLite e logs — monte volumes nesses caminhos para persistir os dados
 RUN mkdir -p /app/data /app/logs
