@@ -121,12 +121,26 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 WORKDIR /app
 
+# ffmpeg: o vídeo de conferência é codificado em H.264 por pipe para o ffmpeg;
+# sem ele o vídeo simplesmente não era gerado.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libglib2.0-0 \
+        libglib2.0-0 ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
+# torch de CPU antes do requirements: senão a ultralytics puxa o torch com CUDA
+# (~2,5 GB) numa imagem que não usa GPU.
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
+        torch==2.15.0 torchvision==0.29.2
+
+# OpenCV < 5: o 5.0 removeu cv2.dnn.readNetFromDarknet (modelo YOLOv4).
+# A ultralytics depende de opencv-python (com GUI, precisa de libGL); trocamos
+# pelo headless. Os dois instalam o mesmo pacote cv2, por isso o headless é
+# reinstalado depois de remover o outro.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt opencv-python-headless
+RUN pip install --no-cache-dir -r requirements.txt "opencv-python-headless>=4.10,<5" \
+    && pip uninstall -y opencv-python \
+    && pip install --no-cache-dir --no-deps --force-reinstall "opencv-python-headless>=4.10,<5" \
+    && python -c "import cv2; assert int(cv2.__version__.split('.')[0]) < 5, cv2.__version__; cv2.dnn.readNetFromDarknet"
 
 COPY src/ ./src/
 COPY models/ ./models/
