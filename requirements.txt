@@ -9,3 +9,8 @@ matplotlib>=3.8
 seaborn>=0.13
 pillow>=10.0                     # frame de fundo da calibração de escala
 streamlit-drawable-canvas>=0.9.3  # desenho da linha de calibração px->mm
+openpyxl>=3.1                    # exportação de relatórios em Excel (.xlsx)
+# Versão fixa: a mesma do pacote beemove (Bee-tracker) e gravada nos pesos .pt.
+# Ela puxa opencv-python e torch; a imagem CPU troca o primeiro pelo headless e
+# instala o torch de CPU antes (ver Dockerfile).
+ultralytics==8.4.69              # treino/fine-tuning YOLO (.pt) dentro do app

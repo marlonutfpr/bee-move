@@ -54,16 +54,36 @@ def _adicionar_figura(pdf, fig):
 
 def _linhas_metricas(m):
     ut, uv = m.get("unidade_t", "s"), m.get("unidade_v", "px/s")
-    linhas = [
-        f"Detecções ................ {m.get('deteccoes', 0)}",
-        f"Distância percorrida ..... {m.get('distancia_px', 0):.1f} px",
-        f"Deslocamento líquido ..... {m.get('deslocamento_liquido_px', 0):.1f} px",
-        f"Retilineidade ............ {m.get('retilineidade', 0):.2f}",
-        f"Velocidade média ......... {m.get('velocidade_media', 0):.1f} {uv}",
-        f"Velocidade máxima ........ {m.get('velocidade_max', 0):.1f} {uv}",
-        f"Tempo em movimento ....... {m.get('perc_movimento', 0):.0f}%",
-        f"Área explorada ........... {m.get('area_explorada_px2', 0):.0f} px²",
-    ]
+    tem_mm = "distancia_mm" in m
+    tem_vel_mm = "velocidade_media_mm_s" in m
+    # Com escala calibrada, mostramos só as métricas em mm (sem duplicar px).
+    if tem_mm:
+        linhas = [
+            f"[Escala {m['pixels_per_mm']:.2f} px/mm — valores em mm]",
+            f"Detecções ................ {m.get('deteccoes', 0)}",
+            f"Distância percorrida ..... {m['distancia_mm']:.1f} mm",
+            f"Deslocamento líquido ..... {m['deslocamento_liquido_mm']:.1f} mm",
+            f"Retilineidade ............ {m.get('retilineidade', 0):.2f}",
+            (f"Velocidade média ......... {m['velocidade_media_mm_s']:.2f} mm/s"
+             if tem_vel_mm else
+             f"Velocidade média ......... {m.get('velocidade_media', 0):.1f} {uv}"),
+            (f"Velocidade máxima ........ {m['velocidade_max_mm_s']:.2f} mm/s"
+             if tem_vel_mm else
+             f"Velocidade máxima ........ {m.get('velocidade_max', 0):.1f} {uv}"),
+            f"Tempo em movimento ....... {m.get('perc_movimento', 0):.0f}%",
+            f"Área explorada ........... {m['area_explorada_mm2']:.1f} mm²",
+        ]
+    else:
+        linhas = [
+            f"Detecções ................ {m.get('deteccoes', 0)}",
+            f"Distância percorrida ..... {m.get('distancia_px', 0):.1f} px",
+            f"Deslocamento líquido ..... {m.get('deslocamento_liquido_px', 0):.1f} px",
+            f"Retilineidade ............ {m.get('retilineidade', 0):.2f}",
+            f"Velocidade média ......... {m.get('velocidade_media', 0):.1f} {uv}",
+            f"Velocidade máxima ........ {m.get('velocidade_max', 0):.1f} {uv}",
+            f"Tempo em movimento ....... {m.get('perc_movimento', 0):.0f}%",
+            f"Área explorada ........... {m.get('area_explorada_px2', 0):.0f} px²",
+        ]
     if "cobertura_perc" in m:
         linhas.append(f"Cobertura do quadro ...... {m['cobertura_perc']:.1f}%")
     if "tempo_detectado" in m:
@@ -75,17 +95,6 @@ def _linhas_metricas(m):
             f"Tempo caminhando ......... {m.get('tempo_movimento', 0):.1f} {ut}",
             f"Tempo parado ............. {m.get('tempo_parado', 0):.1f} {ut}",
         ]
-    if "distancia_mm" in m:
-        linhas += [
-            "",
-            f"[Escala {m['pixels_per_mm']:.2f} px/mm]",
-            f"Distância ................ {m['distancia_mm']:.1f} mm",
-            f"Deslocamento líquido ..... {m['deslocamento_liquido_mm']:.1f} mm",
-            f"Área explorada ........... {m['area_explorada_mm2']:.1f} mm²",
-        ]
-        if "velocidade_media_mm_s" in m:
-            linhas.append(f"Velocidade média ......... {m['velocidade_media_mm_s']:.2f} mm/s")
-            linhas.append(f"Velocidade máxima ........ {m['velocidade_max_mm_s']:.2f} mm/s")
     return linhas
 
 
@@ -253,3 +262,129 @@ def analytics_blob(analise, chave):
     """Decodifica um blob numpy salvo no banco (centroids/frame_indices)."""
     import database
     return database.blob_to_ndarray(analise.get(chave))
+
+
+def _linha_resumo(a):
+    escala = a.get("pixels_per_mm") or 0
+    dist_px = a.get("distance_px") or 0
+    return {
+        "ID": a.get("id"),
+        "Data": (a.get("created_at") or "")[:19],
+        "Vídeo": a.get("video_name"),
+        "Placas": a.get("num_targets") or 1,
+        "Detecções": a.get("detections") or 0,
+        "Distância (px)": round(dist_px, 1),
+        "Distância (mm)": round(dist_px / escala, 1) if escala > 0 else None,
+        "Vel. média (px/s)": round(a.get("avg_speed_px_s") or 0, 1),
+        "Escala (px/mm)": round(escala, 2) if escala > 0 else None,
+        "Áreas": len(_parse_zones(a.get("zones")) or []),
+        "Frame skip": a.get("frame_skip"),
+        "Rede (px)": a.get("input_size"),
+        "Confiança": a.get("conf_threshold"),
+        "NMS": a.get("nms_threshold"),
+        "Backend": a.get("backend"),
+        "Tempo proc. (s)": round(a.get("processing_time_s") or 0, 1),
+    }
+
+
+def _linhas_por_area(a, limiar_parada_px=3.0):
+    """Uma linha por ÁREA (cada área = uma repetição do experimento).
+
+    Sem áreas definidas, devolve uma única linha global. Com escala calibrada,
+    as métricas saem em mm (sem as colunas em px).
+    """
+    centroides = analytics_blob(a, "centroids")
+    indices = analytics_blob(a, "frame_indices")
+    track_ids = analytics_blob(a, "track_ids")
+    zones = _parse_zones(a.get("zones"))
+    escala = a.get("pixels_per_mm") or 0
+    fps = a.get("fps_video")
+    base = {
+        "ID": a.get("id"),
+        "Data": (a.get("created_at") or "")[:19],
+        "Vídeo": a.get("video_name"),
+        "Escala (px/mm)": round(escala, 2) if escala > 0 else None,
+        "Frame skip": a.get("frame_skip"),
+        "Rede (px)": a.get("input_size"),
+        "Confiança": a.get("conf_threshold"),
+        "NMS": a.get("nms_threshold"),
+        "Backend": a.get("backend"),
+    }
+    if centroides is None or len(centroides) == 0:
+        return [{**base, "Área": "—", "Detecções": 0}]
+
+    metr_z = (analytics.metricas_por_zona(centroides, indices, fps, zones,
+                                          a.get("frame_skip"), escala or None)
+              if zones else [])
+    linhas = []
+    for t in analytics.tracks_unicos(track_ids, centroides):
+        c, idx = analytics.subset_track(centroides, indices, track_ids, t)
+        m = analytics.calcular_metricas(
+            c, idx, fps, limiar_parada_px,
+            frames_processados=a.get("frames_processed"),
+            frame_skip=a.get("frame_skip"), pixels_per_mm=escala or None)
+        nome = (zones[t].get("name") if zones and t < len(zones) else None) or (
+            f"Área {t + 1}" if zones else "Global")
+        linha = {**base, "Área": nome, "Detecções": m.get("deteccoes", 0)}
+        if escala > 0 and "distancia_mm" in m:
+            linha["Distância (mm)"] = round(m["distancia_mm"], 1)
+            linha["Desloc. líquido (mm)"] = round(m.get("deslocamento_liquido_mm", 0), 1)
+            if "velocidade_media_mm_s" in m:
+                linha["Vel. média (mm/s)"] = round(m["velocidade_media_mm_s"], 2)
+                linha["Vel. máxima (mm/s)"] = round(m["velocidade_max_mm_s"], 2)
+            linha["Área explorada (mm²)"] = round(m.get("area_explorada_mm2", 0), 1)
+        else:
+            linha["Distância (px)"] = round(m.get("distancia_px", 0), 1)
+            linha["Desloc. líquido (px)"] = round(m.get("deslocamento_liquido_px", 0), 1)
+            linha["Vel. média (px/s)"] = round(m.get("velocidade_media", 0), 1)
+            linha["Área explorada (px²)"] = round(m.get("area_explorada_px2", 0), 0)
+        linha["Retilineidade"] = round(m.get("retilineidade", 0), 2)
+        linha["Tempo mov. (%)"] = round(m.get("perc_movimento", 0), 0)
+        if "tempo_detectado" in m:
+            linha["Tempo detectado (s)"] = round(m["tempo_detectado"], 1)
+        # Presença na área (quando há zonas): permanência e visitas.
+        if zones and t < len(metr_z):
+            mz = metr_z[t]
+            if "tempo_permanencia" in mz:
+                linha["Permanência (s)"] = round(mz["tempo_permanencia"], 1)
+            linha["Visitas"] = mz.get("visitas")
+        linhas.append(linha)
+    return linhas
+
+
+def build_excel(analises_completas, username, limiar_parada_px=3.0) -> bytes:
+    """Planilha .xlsx com UMA LINHA POR ÁREA (repetição). Duas abas:
+    'Por área' (detalhada) e 'Resumo' (uma linha por análise)."""
+    import pandas as pd
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    linhas_area = []
+    for a in analises_completas:
+        linhas_area.extend(_linhas_por_area(a, limiar_parada_px))
+    df_area = pd.DataFrame(linhas_area)
+    df_resumo = pd.DataFrame([_linha_resumo(a) for a in analises_completas])
+
+    def _formatar(ws):
+        cabecalho = Font(bold=True, color="FFFFFF")
+        fundo = PatternFill("solid", fgColor="E8A317")
+        for celula in ws[1]:
+            celula.font = cabecalho
+            celula.fill = fundo
+            celula.alignment = Alignment(horizontal="center", vertical="center")
+        for coluna in ws.columns:
+            largura = max((len(str(c.value)) for c in coluna if c.value is not None),
+                          default=8)
+            ws.column_dimensions[coluna[0].column_letter].width = min(largura + 3, 42)
+        ws.freeze_panes = "A2"
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xls:
+        (df_area if not df_area.empty
+         else pd.DataFrame({"Sem dados": []})).to_excel(
+            xls, index=False, sheet_name="Por área")
+        (df_resumo if not df_resumo.empty
+         else pd.DataFrame({"Sem análises": []})).to_excel(
+            xls, index=False, sheet_name="Resumo")
+        for nome_aba in ("Por área", "Resumo"):
+            _formatar(xls.sheets[nome_aba])
+    return buf.getvalue()

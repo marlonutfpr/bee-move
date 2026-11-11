@@ -1,0 +1,11 @@
+# Tema padrão: ESCURO "mel sofisticado" (âmbar dessaturado sobre neutros
+# quentes). O usuário pode alternar para claro pelo menu ⋮ → Settings → Theme;
+# o CSS em src/ui.py usa sobreposições translúcidas quentes, então o tema claro
+# também fica bem sem precisar de uma segunda configuração.
+[theme]
+base = "dark"
+primaryColor = "#E3A43A"
+backgroundColor = "#1A1714"
+secondaryBackgroundColor = "#232019"
+textColor = "#ECE7DF"
+font = "sans serif"

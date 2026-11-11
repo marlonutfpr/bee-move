@@ -65,3 +65,70 @@ def login(username: str, password: str) -> tuple[dict | None, str]:
     database.touch_last_login(user["id"])
     log_event("login", f"Login de '{username}'", user_id=user["id"])
     return user, ""
+
+
+def change_password(user_id: int, atual: str, nova: str) -> tuple[bool, str]:
+    """Troca a senha do próprio usuário (exige a senha atual)."""
+    user = database.get_user_by_id(user_id)
+    if user is None:
+        return False, "Usuário não encontrado."
+    if not verify_password(atual, user["password_hash"]):
+        return False, "A senha atual está incorreta."
+    if len(nova) < MIN_PASSWORD:
+        return False, f"A nova senha precisa ter ao menos {MIN_PASSWORD} caracteres."
+    database.set_password(user_id, hash_password(nova))
+    log_event("password_changed", "Senha alterada pelo próprio usuário", user_id=user_id)
+    return True, "Senha alterada com sucesso."
+
+
+# --- Operações de administrador ---
+
+def admin_create_user(username: str, password: str, role: str = "user") -> tuple[bool, str]:
+    username = username.strip()
+    if len(username) < MIN_USERNAME:
+        return False, f"O usuário precisa ter ao menos {MIN_USERNAME} caracteres."
+    if len(password) < MIN_PASSWORD:
+        return False, f"A senha precisa ter ao menos {MIN_PASSWORD} caracteres."
+    if role not in ("user", "admin"):
+        role = "user"
+    user_id = database.create_user(username, hash_password(password), role=role)
+    if user_id is None:
+        return False, "Este nome de usuário já está em uso."
+    log_event("user_created_admin", f"Usuário '{username}' criado pelo admin ({role})",
+              user_id=user_id)
+    return True, f"Usuário '{username}' criado."
+
+
+def admin_reset_password(user_id: int, nova: str) -> tuple[bool, str]:
+    if len(nova) < MIN_PASSWORD:
+        return False, f"A nova senha precisa ter ao menos {MIN_PASSWORD} caracteres."
+    database.set_password(user_id, hash_password(nova))
+    log_event("password_reset_admin", f"Senha redefinida pelo admin (user {user_id})",
+              user_id=user_id)
+    return True, "Senha redefinida."
+
+
+def admin_set_role(user_id: int, role: str) -> tuple[bool, str]:
+    if role not in ("user", "admin"):
+        return False, "Perfil inválido."
+    # Impede remover o último admin do sistema.
+    if role == "user":
+        alvo = database.get_user_by_id(user_id)
+        if alvo and alvo["role"] == "admin" and database.count_admins() <= 1:
+            return False, "Não é possível rebaixar o último administrador."
+    database.set_role(user_id, role)
+    log_event("role_changed_admin", f"Perfil do usuário {user_id} alterado para {role}",
+              user_id=user_id)
+    return True, "Perfil atualizado."
+
+
+def admin_delete_user(user_id: int) -> tuple[bool, str]:
+    alvo = database.get_user_by_id(user_id)
+    if alvo is None:
+        return False, "Usuário não encontrado."
+    if alvo["role"] == "admin" and database.count_admins() <= 1:
+        return False, "Não é possível excluir o último administrador."
+    database.delete_user(user_id)
+    log_event("user_deleted_admin", f"Usuário '{alvo['username']}' excluído pelo admin",
+              user_id=None)
+    return True, f"Usuário '{alvo['username']}' excluído (e suas análises)."
