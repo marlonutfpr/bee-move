@@ -89,7 +89,9 @@ CREATE TABLE IF NOT EXISTS annotation_candidates (
     height      INTEGER,
     status      TEXT NOT NULL DEFAULT 'pendente',  -- pendente|anotado|sem_abelha|descartado
     labels      TEXT,           -- JSON: caixas anotadas [[x,y,w,h], ...] (px da imagem)
-    image_jpg   BLOB
+    image_jpg   BLOB,
+    label_source TEXT,          -- 'validado' (predição aceita) | 'reanotado' | NULL
+    origin      TEXT            -- 'processamento' | 'conferencia' (NULL = processamento)
 );
 CREATE INDEX IF NOT EXISTS idx_cand_user ON annotation_candidates(user_id, status);
 
@@ -148,6 +150,11 @@ def _migrate(conn):
         "PRAGMA table_info(annotation_candidates)")}
     if cols_cand and "area" not in cols_cand:
         conn.execute("ALTER TABLE annotation_candidates ADD COLUMN area TEXT")
+    # Origem da anotação (predição validada x reanotada) e de onde veio o
+    # candidato (coleta no processamento x tela de Conferência).
+    for col in ("label_source", "origin"):
+        if cols_cand and col not in cols_cand:
+            conn.execute(f"ALTER TABLE annotation_candidates ADD COLUMN {col} TEXT")
 
     # Perfis de usuário (admin/comum). Garante ao menos um admin nos bancos
     # antigos promovendo o usuário mais antigo.
@@ -307,6 +314,15 @@ def list_analyses(user_id: int) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+def analysis_exists(analysis_id: int, user_id: int) -> bool:
+    """A análise existe e é do usuário? (consulta leve, sem os blobs)"""
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT 1 FROM analyses WHERE id = ? AND user_id = ?",
+            (analysis_id, user_id),
+        ).fetchone() is not None
+
+
 def get_analysis(analysis_id: int, user_id: int) -> dict | None:
     """Análise completa (com blobs). Retorna None se não for do usuário."""
     with get_conn() as conn:
@@ -368,39 +384,96 @@ def list_logs(user_id: int | None = None, limit: int = 100) -> list[dict]:
 
 def add_candidate(user_id, analysis_id, video_name, frame_index, reason,
                   pred_conf, pred_boxes, width, height, image_jpg,
-                  area=None) -> int:
+                  area=None, origin="processamento") -> int:
+    """`origin`: 'processamento' (coleta durante a análise) ou 'conferencia'."""
     with get_conn() as conn:
         cur = conn.execute(
             """INSERT INTO annotation_candidates (
                    user_id, analysis_id, video_name, area, frame_index, reason,
-                   pred_conf, pred_boxes, width, height, image_jpg
-               ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                   pred_conf, pred_boxes, width, height, image_jpg, origin
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (user_id, analysis_id, video_name, area, frame_index, reason,
-             pred_conf, json.dumps(pred_boxes or []), width, height, image_jpg),
+             pred_conf, json.dumps(pred_boxes or []), width, height, image_jpg,
+             origin),
         )
         return cur.lastrowid
 
 
-def list_candidates(user_id: int, status: str | None = None) -> list[dict]:
+def list_candidates(user_id: int, status: str | None = None,
+                    analysis_id: int | None = None) -> list[dict]:
     """Resumo dos candidatos (sem o JPEG), mais recentes primeiro."""
-    q = ("SELECT id, created_at, video_name, area, frame_index, reason, pred_conf, "
-         "status, width, height FROM annotation_candidates WHERE user_id = ?")
+    q = ("SELECT id, analysis_id, created_at, video_name, area, frame_index, reason, "
+         "pred_conf, status, width, height, label_source, "
+         "COALESCE(origin, 'processamento') AS origin "
+         "FROM annotation_candidates WHERE user_id = ?")
     args = [user_id]
     if status:
         q += " AND status = ?"
         args.append(status)
+    if analysis_id is not None:
+        q += " AND analysis_id = ?"
+        args.append(analysis_id)
     q += " ORDER BY id DESC"
     with get_conn() as conn:
         return [dict(r) for r in conn.execute(q, args).fetchall()]
 
 
-def candidate_counts(user_id: int) -> dict:
+def candidate_counts(user_id: int, analysis_id: int | None = None) -> dict:
+    q = "SELECT status, COUNT(*) AS c FROM annotation_candidates WHERE user_id = ?"
+    args = [user_id]
+    if analysis_id is not None:
+        q += " AND analysis_id = ?"
+        args.append(analysis_id)
+    with get_conn() as conn:
+        rows = conn.execute(q + " GROUP BY status", args).fetchall()
+    return {r["status"]: r["c"] for r in rows}
+
+
+def candidate_breakdown(user_id: int, analysis_id: int | None = None) -> dict:
+    """Composição dos candidatos: pendentes, validados (predição aceita),
+    reanotados (caixas desenhadas; anotações antigas sem origem contam aqui),
+    negativos (sem abelha), descartados e quantos rotulados vieram da Conferência.
+    """
+    q = """SELECT
+             COALESCE(SUM(status = 'pendente'), 0) AS pendente,
+             COALESCE(SUM(status = 'anotado' AND label_source = 'validado'), 0)
+                 AS validado,
+             COALESCE(SUM(status = 'anotado'
+                          AND COALESCE(label_source, '') <> 'validado'), 0)
+                 AS reanotado,
+             COALESCE(SUM(status = 'sem_abelha'), 0) AS sem_abelha,
+             COALESCE(SUM(status = 'descartado'), 0) AS descartado,
+             COALESCE(SUM(status IN ('anotado', 'sem_abelha')
+                          AND origin = 'conferencia'), 0) AS conferencia
+           FROM annotation_candidates WHERE user_id = ?"""
+    args = [user_id]
+    if analysis_id is not None:
+        q += " AND analysis_id = ?"
+        args.append(analysis_id)
+    with get_conn() as conn:
+        return dict(conn.execute(q, args).fetchone())
+
+
+def candidate_exists(user_id: int, analysis_id: int, frame_index: int,
+                     area: str | None) -> bool:
+    """Já há candidato deste usuário para a mesma análise, frame e área?"""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM annotation_candidates WHERE user_id = ? "
+            "AND analysis_id = ? AND frame_index = ? AND area IS ? LIMIT 1",
+            (user_id, analysis_id, int(frame_index), area),
+        ).fetchone()
+    return row is not None
+
+
+def candidate_keys(user_id: int, analysis_id: int) -> set:
+    """{(frame_index, area)} dos candidatos já guardados de uma análise."""
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT status, COUNT(*) AS c FROM annotation_candidates "
-            "WHERE user_id = ? GROUP BY status", (user_id,),
+            "SELECT frame_index, area FROM annotation_candidates "
+            "WHERE user_id = ? AND analysis_id = ?", (user_id, analysis_id),
         ).fetchall()
-    return {r["status"]: r["c"] for r in rows}
+    return {(r["frame_index"], r["area"]) for r in rows}
 
 
 def get_candidate(cand_id: int, user_id: int) -> dict | None:
@@ -412,12 +485,14 @@ def get_candidate(cand_id: int, user_id: int) -> dict | None:
         return dict(row) if row else None
 
 
-def set_candidate_labels(cand_id: int, user_id: int, labels, status: str) -> bool:
+def set_candidate_labels(cand_id: int, user_id: int, labels, status: str,
+                         source: str | None = None) -> bool:
+    """Grava as caixas e o status; `source`: 'validado' | 'reanotado' | None."""
     with get_conn() as conn:
         cur = conn.execute(
-            "UPDATE annotation_candidates SET labels = ?, status = ? "
+            "UPDATE annotation_candidates SET labels = ?, status = ?, label_source = ? "
             "WHERE id = ? AND user_id = ?",
-            (json.dumps(labels or []), status, cand_id, user_id),
+            (json.dumps(labels or []), status, source, cand_id, user_id),
         )
         return cur.rowcount > 0
 

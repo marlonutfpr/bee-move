@@ -16,6 +16,7 @@ Persistência e usuários:
   app_logging.py.
 """
 
+import copy
 import html
 import json
 import logging
@@ -44,6 +45,7 @@ import matplotlib.pyplot as plt
 
 import analytics
 import auth
+import conferencia
 import database
 import dataset
 import report
@@ -165,6 +167,15 @@ def modelo_ativo() -> tuple[str, str]:
     if not os.path.exists(cfg):
         cfg = YOLO_CFG
     return cfg, weights
+
+
+def ativar_modelo(weights, cfg, user_id, evento="model_selected"):
+    """Torna (weights, cfg) o modelo ativo de todos os usuários (Admin → Modelos)."""
+    database.set_setting("active_weights", str(weights))
+    database.set_setting("active_cfg", str(cfg or ""))
+    carregar_modelo.clear()   # invalida o cache p/ recarregar os novos pesos
+    log_event(evento, f"Modelo ativo: {os.path.basename(str(weights))}",
+              user_id=user_id)
 
 
 class ErroCarga(str):
@@ -372,6 +383,7 @@ class Resultado:
     num_alvos: int = 1
     video_deteccoes: str = None   # caminho do MP4 de conferência (opcional)
     candidatos: list = None       # frames p/ reanotação (opcional)
+    frames_lidos: list = None     # índices dos frames processados (em ordem)
 
 
 class RastreadorMultiplo:
@@ -417,6 +429,60 @@ class RastreadorMultiplo:
         return [(atrib[di], pontos[di]) for di in sorted(atrib)]
 
 
+def _id_classe_alvo(class_names) -> int:
+    """Índice da classe alvo (TARGET_CLASS) em class_names; -1 = aceitar todas."""
+    if class_names and TARGET_CLASS in class_names:
+        return class_names.index(TARGET_CLASS)
+    return -1
+
+
+def _zonas_validas(zones):
+    """(polígonos (N,2), nomes) das áreas com ≥3 pontos; ([], []) sem áreas.
+
+    O índice na lista é o track_id da área no processamento.
+    """
+    polys, nomes = [], []
+    for z in zones or []:
+        pts = z.get("points") or []
+        if len(pts) >= 3:
+            polys.append(np.asarray(pts, float).reshape(-1, 2))
+            nomes.append(z.get("name") or t("core.zone_default", n=len(nomes) + 1))
+    return polys, nomes
+
+
+def _montar_candidato(indice, img_bgr, melhor_s, sugeridas, area=None):
+    """Dict de candidato a reanotação (formato de database.add_candidate) ou None.
+
+    `melhor_s` = 0 → 'sem_deteccao'; acima de 0 → 'baixa_confianca'.
+    """
+    ok_jpg, jpg = cv2.imencode(".jpg", img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 88])
+    if not ok_jpg:
+        return None
+    h0, w0 = img_bgr.shape[:2]
+    return {
+        "frame_index": int(indice),
+        "reason": "sem_deteccao" if melhor_s == 0 else "baixa_confianca",
+        "pred_conf": float(melhor_s), "pred_boxes": sugeridas,
+        "width": int(w0), "height": int(h0),
+        "image_jpg": jpg.tobytes(), "area": area,
+    }
+
+
+def _caixas_alvo(model, img, conf, nms, id_alvo):
+    """Passe de detecção filtrado à classe alvo: [[x,y,w,h,score], ...] (px)."""
+    classes, scores, boxes = model.detect(img, conf, nms)
+    if len(scores) == 0:
+        return []
+    scores = np.asarray(scores).reshape(-1)
+    classes = np.asarray(classes).reshape(-1)
+    boxes = np.asarray(boxes).reshape(-1, 4)
+    if id_alvo >= 0:
+        m = classes == id_alvo
+        scores, boxes = scores[m], boxes[m]
+    return [[float(x), float(y), float(w), float(h), float(s)]
+            for s, (x, y, w, h) in zip(scores, boxes)]
+
+
 def processar_video(video_path, model, class_names, frame_skip, conf, nms,
                     num_alvos=1, zones=None, ampliar_areas=False, gerar_video=False,
                     inicio_s=0.0, fim_s=None, coletar_candidatos=False,
@@ -433,10 +499,8 @@ def processar_video(video_path, model, class_names, frame_skip, conf, nms,
     fase(t("analysis.phase_reading", total=leitor.total_frames, skip=max(1, frame_skip),
            n=-(-leitor.total_frames // max(1, frame_skip))))
 
-    id_alvo = -1
-    if class_names and TARGET_CLASS in class_names:
-        id_alvo = class_names.index(TARGET_CLASS)
-    elif class_names:
+    id_alvo = _id_classe_alvo(class_names)
+    if class_names and id_alvo < 0:
         st.warning(t("core.class_not_found", cls=TARGET_CLASS, names=YOLO_NAMES))
 
     # Quando há áreas definidas, cada área é uma placa/abelha: a detecção é
@@ -448,12 +512,7 @@ def processar_video(video_path, model, class_names, frame_skip, conf, nms,
     zone_names = []
     if zones:
         from matplotlib.path import Path as _MplPath
-        zone_polys = []
-        for z in zones:
-            pts = z.get("points") or []
-            if len(pts) >= 3:
-                zone_polys.append(np.asarray(pts, float).reshape(-1, 2))
-                zone_names.append(z.get("name") or t("core.zone_default", n=len(zone_names) + 1))
+        zone_polys, zone_names = _zonas_validas(zones)
         if zone_polys:
             zone_paths = [_MplPath(p) for p in zone_polys]
             num_alvos = len(zone_paths)
@@ -470,6 +529,7 @@ def processar_video(video_path, model, class_names, frame_skip, conf, nms,
     try:
 
         centroides, indices_frames, track_ids = [], [], []
+        frames_lidos = []   # todos os frames processados (p/ a Conferência)
         rastreador = RastreadorMultiplo(num_alvos)
         primeiro_frame = None
         processados = 0
@@ -487,6 +547,7 @@ def processar_video(video_path, model, class_names, frame_skip, conf, nms,
             if item is None:
                 break
             indice, frame = item
+            frames_lidos.append(int(indice))
             if primeiro_frame is None:
                 primeiro_frame = frame.copy()
 
@@ -560,17 +621,9 @@ def processar_video(video_path, model, class_names, frame_skip, conf, nms,
             # passe de baixa confiança; guarda os fracos/ausentes. Com áreas, gera
             # UM candidato por área (recorte) — imagem menor, abelha maior.
             def _guardar_candidato(img_bgr, melhor_s, sugeridas, area=None):
-                ok_jpg, jpg = cv2.imencode(".jpg", img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 88])
-                if not ok_jpg:
-                    return
-                h0, w0 = img_bgr.shape[:2]
-                candidatos.append({
-                    "frame_index": int(indice),
-                    "reason": "sem_deteccao" if melhor_s == 0 else "baixa_confianca",
-                    "pred_conf": melhor_s, "pred_boxes": sugeridas,
-                    "width": int(w0), "height": int(h0),
-                    "image_jpg": jpg.tobytes(), "area": area,
-                })
+                cand = _montar_candidato(indice, img_bgr, melhor_s, sugeridas, area)
+                if cand is not None:
+                    candidatos.append(cand)
 
             if (coletar_candidatos and len(candidatos) < max_candidatos
                     and processados % passo_cap == 0):
@@ -593,18 +646,8 @@ def processar_video(video_path, model, class_names, frame_skip, conf, nms,
                         _guardar_candidato(recorte, sc, sugeridas, zone_names[zi])
                 else:
                     # sem áreas: candidato do frame inteiro
-                    cc, sc_c, bx_c = model.detect(frame, conf_captura, nms)
-                    sugeridas, melhor_s = [], 0.0
-                    if len(sc_c) > 0:
-                        sc_c = np.asarray(sc_c).reshape(-1)
-                        cc = np.asarray(cc).reshape(-1)
-                        bx_c = np.asarray(bx_c).reshape(-1, 4)
-                        if id_alvo >= 0:
-                            mc = cc == id_alvo
-                            sc_c, bx_c = sc_c[mc], bx_c[mc]
-                        for s, (x, y, w, h) in zip(sc_c, bx_c):
-                            sugeridas.append([float(x), float(y), float(w), float(h), float(s)])
-                        melhor_s = float(np.max(sc_c)) if len(sc_c) else 0.0
+                    sugeridas = _caixas_alvo(model, frame, conf_captura, nms, id_alvo)
+                    melhor_s = max((b[4] for b in sugeridas), default=0.0)
                     if melhor_s < limiar_revisao:
                         _guardar_candidato(frame, melhor_s, sugeridas, None)
 
@@ -657,6 +700,7 @@ def processar_video(video_path, model, class_names, frame_skip, conf, nms,
         num_alvos=num_alvos,
         video_deteccoes=video_conf,
         candidatos=candidatos if coletar_candidatos else None,
+        frames_lidos=frames_lidos,
     )
 
 
@@ -1371,6 +1415,8 @@ def exibir_analise_salva(analise: dict, user_id: int, limiar_parada_px: float):
                       user_id=user_id, analysis_id=aid)
             if st.session_state.get("_keep_hist_analise") == aid:
                 st.session_state.pop("_keep_hist_analise", None)
+            if (st.session_state.get("conf_ctx") or {}).get("analysis_id") == aid:
+                st.session_state.pop("conf_ctx", None)  # Conferência desta análise
         ui.confirm_delete(
             t("history.delete_dialog_title", id=analise["id"]),
             t("history.delete_dialog_body", id=analise["id"],
@@ -1750,14 +1796,20 @@ def ferramenta_calibracao(video_path):
                            width="stretch")
     if calcular:
         objetos = (canvas.json_data or {}).get("objects") if canvas else None
-        linhas = [o for o in (objetos or []) if o.get("type") == "line"]
+        # O canvas ≥0.12 (Fabric.js 6) devolve o tipo com o nome da classe
+        # ("Line"); o 0.9 (Fabric 4) devolvia "line".
+        linhas = [o for o in (objetos or [])
+                  if str(o.get("type", "")).lower() == "line"]
         if not linhas:
             st.error(t("calib.draw_line_first"))
         else:
             o = linhas[-1]
             # O comprimento (x2-x1, y2-y1) independe de left/top: o
             # deslocamento entre extremos é invariante ao centro do objeto.
-            comp_canvas = float(np.hypot(o["x2"] - o["x1"], o["y2"] - o["y1"]))
+            # scaleX/scaleY: a linha pode ter sido esticada no modo de edição.
+            comp_canvas = float(np.hypot(
+                (o["x2"] - o["x1"]) * float(o.get("scaleX") or 1),
+                (o["y2"] - o["y1"]) * float(o.get("scaleY") or 1)))
             comp_imagem = comp_canvas * (largura / canvas_w)  # canvas -> resolução real
             if comp_imagem > 0:
                 escala = comp_imagem / comprimento_mm
@@ -1841,7 +1893,9 @@ def _circulos_para_canvas(circulos, escala):
     usuário pode mover/excluir/redimensionar cada forma antes de salvar.
     """
     objetos = [
-        {"type": "circle",
+        # Nome de classe ("Circle"): o Fabric 6 do canvas ≥0.12 registra as
+        # classes assim, e o Fabric 4 do 0.9 também aceita (capitaliza o tipo).
+        {"type": "Circle",
          "left": cx / escala, "top": cy / escala, "radius": r / escala,
          "originX": "center", "originY": "center", "angle": 0,
          "scaleX": 1, "scaleY": 1, "strokeWidth": 2,
@@ -2582,7 +2636,8 @@ def _executar_analise(user_id, model, backend, class_names, frame_skip, input_si
         st.session_state["resultado"] = resultado
         st.session_state["resultado_frame_skip"] = frame_skip
         st.session_state["resultado_pixels_per_mm"] = params["pixels_per_mm"]
-        st.session_state["resultado_zones"] = zonas
+        # Cópia: os nomes das áreas em Nova Análise são editados no próprio dict.
+        st.session_state["resultado_zones"] = copy.deepcopy(zonas)
         st.session_state["resultado_conf"] = conf
         # Vídeo de conferência: remove o anterior e guarda o novo caminho.
         antigo_video = st.session_state.pop("video_deteccoes", None)
@@ -2606,6 +2661,10 @@ def _executar_analise(user_id, model, backend, class_names, frame_skip, input_si
             st.write(t("analysis.phase_candidates", n=n_cand))
             log_event("candidates_collected", f"{n_cand} candidatos de '{video_nome}'",
                       user_id=user_id, analysis_id=analysis_id)
+        # Contexto p/ anotar, na Conferência, os frames abaixo do limiar.
+        st.session_state["conf_ctx"] = _contexto_conferencia(
+            resultado, analysis_id, video_path, video_nome, frame_skip, conf, nms,
+            zonas, usar_ampliacao)
         decorrido = time.perf_counter() - t0
         caixa.update(label=t("analysis.status_done", id=analysis_id,
                              time=_fmt_duracao(decorrido)),
@@ -2622,28 +2681,49 @@ def _executar_analise(user_id, model, backend, class_names, frame_skip, input_si
         ui.flash(t("core.class_not_found", cls=TARGET_CLASS, names=YOLO_NAMES), "warning")
 
 
-def render_conferencia():
+def render_conferencia(user_id, model, class_names):
     """Aba de conferência: reproduz o vídeo anotado das detecções do último
-    processamento, para o usuário verificar e ajustar os parâmetros."""
+    processamento e permite anotar os frames que ficaram abaixo do limiar."""
     st.markdown(t("analysis.review_title"))
     st.caption(t("analysis.review_caption"))
     path = st.session_state.get("video_deteccoes")
-    if not path or not os.path.exists(path):
-        # Estado vazio: como gerar o vídeo (rótulos exatos da barra lateral).
-        with st.container(border=True):
-            st.markdown(t("analysis.review_empty_title"))
-            st.markdown(t("analysis.review_empty_steps",
-                          settings=t("sidebar.settings"),
-                          section=t("sidebar.detection"),
-                          option=t("sidebar.review_video"),
-                          new=t("sidebar.tab_new_analysis")))
-            if st.session_state.get("cfg_gerar_video") is False:
-                st.warning(t("analysis.review_option_off", option=t("sidebar.review_video")))
-            st.caption(t("analysis.review_empty_note"))
-            if st.button(t("analysis.go_new"), type="primary",
-                         key="conf_ir_nova"):
-                go_to("new")
+    tem_video = bool(path and os.path.exists(path))
+    ctx = st.session_state.get("conf_ctx")
+    if not isinstance(ctx, dict) or not database.analysis_exists(
+            ctx.get("analysis_id"), user_id):
+        # Sem contexto, ou a análise foi excluída no Histórico.
+        st.session_state.pop("conf_ctx", None)
+        ctx = None
+    if not tem_video and ctx is None:
+        _conferencia_vazia()
         return
+    if tem_video:
+        _conferencia_video(path)
+    else:
+        st.info(t("review.no_video_but_ctx", option=t("sidebar.review_video")))
+    if ctx is not None:
+        _conf_secao_anotacao(user_id, model, class_names, ctx)
+
+
+def _conferencia_vazia():
+    """Estado vazio: como gerar o vídeo (rótulos exatos da barra lateral)."""
+    with st.container(border=True):
+        st.markdown(t("analysis.review_empty_title"))
+        st.markdown(t("analysis.review_empty_steps",
+                      settings=t("sidebar.settings"),
+                      section=t("sidebar.detection"),
+                      option=t("sidebar.review_video"),
+                      new=t("sidebar.tab_new_analysis")))
+        if st.session_state.get("cfg_gerar_video") is False:
+            st.warning(t("analysis.review_option_off", option=t("sidebar.review_video")))
+        st.caption(t("analysis.review_empty_note"))
+        if st.button(t("analysis.go_new"), type="primary",
+                     key="conf_ir_nova"):
+            go_to("new")
+
+
+def _conferencia_video(path):
+    """Vídeo de conferência (legenda + player + download)."""
     nome = st.session_state.get("video_deteccoes_nome")
     if nome:
         st.caption(t("analysis.review_source", name=_md_esc(nome)))
@@ -2667,10 +2747,280 @@ def render_conferencia():
         st.warning(t("analysis.review_unreadable"))
 
 
+# --- Conferência: anotar os frames que ficaram abaixo do limiar ---
+
+def _contexto_conferencia(resultado, analysis_id, video_path, video_nome, frame_skip,
+                          conf, nms, zonas, ampliar_areas) -> dict:
+    """O que a Conferência precisa para refazer, depois, os frames/áreas sem
+    detecção aceita do último processamento (st.session_state["conf_ctx"])."""
+    return {
+        "analysis_id": int(analysis_id), "video_path": video_path,
+        "video_nome": video_nome, "frame_skip": int(frame_skip),
+        "conf": float(conf), "nms": float(nms), "zones": _zonas_congeladas(zonas),
+        "ampliar_areas": bool(ampliar_areas),
+        "num_alvos": int(resultado.num_alvos),
+        "frames_lidos": list(resultado.frames_lidos or []),
+        "aceitos": conferencia.frames_aceitos(resultado.indices_frames,
+                                              resultado.track_ids),
+    }
+
+
+def _zonas_congeladas(zonas) -> list:
+    """Áreas válidas com o nome JÁ resolvido (cópia independente da sessão).
+
+    Os nomes são a chave dos candidatos no banco (frame, área): renomear a área
+    em Nova Análise ou trocar o idioma (nome padrão "Área n") depois do
+    processamento não pode mudá-los. Nomes repetidos ganham um sufixo " (n)"
+    para que cada área tenha a sua chave.
+    """
+    polys, nomes = _zonas_validas(zonas)
+    saida, vistos = [], set()
+    for i, (p, nome) in enumerate(zip(polys, nomes), 1):
+        if nome in vistos:
+            nome = f"{nome} ({i})"
+        vistos.add(nome)
+        saida.append({"name": nome, "points": p.tolist()})
+    return saida
+
+
+def _chave_par(par, nomes):
+    """(frame, nome da área|None): a chave de um par como fica no banco."""
+    f, zi = par
+    return f, (nomes[zi] if zi is not None else None)
+
+
+def _pares_conferencia(ctx):
+    """(pares (frame, área|None) sem detecção aceita, polígonos, nomes das áreas)."""
+    polys, nomes = _zonas_validas(ctx.get("zones"))
+    n_alvos = len(polys) if polys else ctx.get("num_alvos", 1)
+    pares = conferencia.pares_sem_deteccao(ctx.get("frames_lidos"), ctx.get("aceitos"),
+                                           n_alvos, bool(polys))
+    return pares, polys, nomes
+
+
+def _melhor_abaixo(sugeridas, conf) -> float:
+    """Melhor score das sugestões ABAIXO do limiar da análise (0 = nenhuma).
+
+    Sem áreas e com 2+ abelhas, o frame tem detecções aceitas (≥ limiar) das
+    outras abelhas; com áreas, o passe no recorte pode achar a abelha acima do
+    limiar. Essas caixas ficam nas sugestões (para validar), mas não definem o
+    motivo 'baixa_confianca' nem a confiança mostrada.
+    """
+    return max((b[4] for b in sugeridas if b[4] < conf), default=0.0)
+
+
+def _candidato_conferencia(frame, indice, zi, model, conf_captura, conf, nms, id_alvo,
+                           polys, paths, nomes):
+    """Candidato de um frame: recorte da área `zi` ou o frame inteiro (zi None)."""
+    if zi is None:
+        sugeridas = _caixas_alvo(model, frame, conf_captura, nms, id_alvo)
+        return _montar_candidato(indice, frame, _melhor_abaixo(sugeridas, conf),
+                                 sugeridas)
+    outras = [p for j, p in enumerate(paths) if j != zi]
+    rc = _recorte_candidato(frame, model, conf_captura, nms, id_alvo,
+                            polys[zi], paths[zi], outras)
+    if rc is None:
+        return None
+    recorte, _, sugeridas = rc
+    return _montar_candidato(indice, recorte, _melhor_abaixo(sugeridas, conf),
+                             sugeridas, nomes[zi])
+
+
+def coletar_frames_abaixo_limiar(ctx, model, class_names, conf_captura, max_itens,
+                                 progresso=None, ignorar=None, falhas=None):
+    """Frames/áreas do último processamento sem detecção aceita → candidatos.
+
+    Escolhe até `max_itens` pares (frame, área) espalhados pelo trecho, lê cada
+    frame uma vez e roda um passe de baixa confiança (`conf_captura`) para as
+    sugestões. Com áreas, cada item é o recorte da área (caixas em px do
+    recorte); sem áreas, o frame inteiro. `ignorar`: {(frame, área)} já
+    guardados. `falhas`: set opcional que recebe as chaves (frame, área) que
+    não puderam ser lidas/recortadas. `progresso(i, n)`: chamado a cada frame
+    lido. Devolve dicts no mesmo formato dos candidatos de processar_video.
+    """
+    from matplotlib.path import Path as _MplPath
+    pares, polys, nomes = _pares_conferencia(ctx)
+    ignorar = ignorar or set()
+    falhas = falhas if falhas is not None else set()
+    pares = [par for par in pares if _chave_par(par, nomes) not in ignorar]
+    por_frame = {}
+    for f, zi in conferencia.espalhar_no_tempo(pares, ctx.get("frames_lidos"),
+                                               max_itens):
+        por_frame.setdefault(f, []).append(zi)
+    paths = [_MplPath(p) for p in polys]
+    id_alvo = _id_classe_alvo(class_names)
+    nms = float(ctx.get("nms", 0.3))
+    conf = float(ctx.get("conf", 1.0))
+    saida = []
+    cap = cv2.VideoCapture(ctx["video_path"])
+    try:
+        if not cap.isOpened():
+            raise OSError(t("core.video_open_error"))
+        frames = sorted(por_frame)
+        for i, f in enumerate(frames, 1):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, f)
+            ok, frame = cap.read()
+            for zi in por_frame[f]:
+                cand = (_candidato_conferencia(frame, f, zi, model, conf_captura, conf,
+                                               nms, id_alvo, polys, paths, nomes)
+                        if ok and frame is not None else None)
+                if cand is not None:
+                    saida.append(cand)
+                else:
+                    falhas.add(_chave_par((f, zi), nomes))
+            if progresso is not None:
+                progresso(i, len(frames))
+    finally:
+        cap.release()
+    return saida
+
+
+def _conf_coletar(user_id, model, class_names, ctx, conf_captura, max_itens):
+    """Trabalho longo do botão: coleta e guarda os candidatos (origem Conferência)."""
+    aid = ctx["analysis_id"]
+    with st.status(t("review.collecting"), expanded=True) as caixa:
+        barra = st.progress(0.0)
+
+        def _prog(i, n):
+            barra.progress(i / max(n, 1), text=t("review.collect_progress", i=i, n=n))
+
+        # Pares que não puderam ser lidos/recortados ficam no contexto: não
+        # voltam a ocupar vagas nem contam como "faltando coletar".
+        falhas = ctx.setdefault("falhas", set())
+        try:
+            itens = coletar_frames_abaixo_limiar(
+                ctx, model, class_names, conf_captura, max_itens, progresso=_prog,
+                ignorar=database.candidate_keys(user_id, aid) | falhas,
+                falhas=falhas)
+        except Exception as e:
+            log_event("candidates_collect_failed",
+                      f"Erro ao coletar frames na conferência: {e}",
+                      user_id=user_id, analysis_id=aid, level=logging.ERROR)
+            caixa.update(label=t("review.collect_failed_status"), state="error")
+            ui.flash(t("review.collect_failed", error=e), "error")
+            return
+        n = 0
+        for c in itens:
+            if database.candidate_exists(user_id, aid, c["frame_index"], c.get("area")):
+                continue
+            database.add_candidate(
+                user_id, aid, ctx.get("video_nome"), c["frame_index"], c["reason"],
+                c["pred_conf"], c["pred_boxes"], c["width"], c["height"],
+                c["image_jpg"], area=c.get("area"), origin="conferencia")
+            n += 1
+        caixa.update(label=t("review.collect_done_status", n=n), state="complete",
+                     expanded=False)
+    log_event("candidates_collected_review",
+              f"{n} frame(s) abaixo do limiar coletado(s) na conferência de "
+              f"'{ctx.get('video_nome')}'",
+              user_id=user_id, analysis_id=aid, conf_captura=conf_captura)
+    if n:
+        ui.flash(t("review.collected", n=n))
+    else:
+        ui.flash(t("review.collected_none"), "info")
+
+
+def _conf_secao_anotacao(user_id, model, class_names, ctx):
+    """Seção da Conferência: coletar e anotar os frames sem detecção aceita."""
+    aid = ctx["analysis_id"]
+    conf = float(ctx.get("conf", 0.4))
+    pares, polys, nomes = _pares_conferencia(ctx)
+    n_frames, n_pares = conferencia.resumo_faltantes(pares)
+    n_lidos = len(ctx.get("frames_lidos") or [])
+    with st.container(border=True):
+        st.markdown(t("review.annot_title"))
+        st.caption(t("review.annot_caption", id=aid))
+        if polys:
+            st.markdown(t("review.stats_zones", frames=n_frames, total=n_lidos,
+                          pairs=n_pares, conf=conf))
+            st.caption(t("review.mode_zones", n=len(polys)))
+        else:
+            st.markdown(t("review.stats_whole", frames=n_frames, total=n_lidos,
+                          n=ctx.get("num_alvos", 1), conf=conf))
+            st.caption(t("review.mode_whole"))
+        ja = database.candidate_keys(user_id, aid)
+        falhas = ctx.get("falhas") or set()
+        chaves = [_chave_par(par, nomes) for par in pares]
+        n_ja = sum(1 for k in chaves if k in ja)
+        n_falhas = sum(1 for k in chaves if k in falhas and k not in ja)
+        restantes = n_pares - n_ja - n_falhas
+        if n_falhas:
+            st.caption(t("review.unreadable", n=n_falhas))
+        pedido = _conf_controles_coleta(ctx, n_pares, n_ja, restantes,
+                                        model is not None)
+        if pedido is not None:
+            # Trabalho longo: um elemento simples no lugar do bloco do anotador
+            # tira da tela (e de alcance) o anotador/botões da execução anterior,
+            # que continuariam clicáveis e interromperiam a coleta.
+            st.empty()
+            with _tarefa_longa():
+                _conf_coletar(user_id, model, class_names, ctx, *pedido)
+        with st.container():
+            _conf_anotacao_analise(user_id, aid)
+
+
+def _conf_controles_coleta(ctx, n_pares, n_ja, restantes, tem_modelo):
+    """Quantidade, confiança das sugestões e o botão de coleta.
+
+    Devolve (conf_captura, max_itens) quando o botão foi clicado; senão None.
+    """
+    aid = ctx["analysis_id"]
+    conf = float(ctx.get("conf", 0.4))
+    if n_pares == 0:
+        st.success(t("review.none_missing", conf=conf))
+        return None
+    if n_ja:
+        st.caption(t("review.already_collected", n=n_ja, left=restantes))
+    if restantes == 0:
+        st.info(t("review.all_collected"))
+        return None
+    if not os.path.exists(ctx.get("video_path") or ""):
+        st.info(t("review.video_gone"))
+        return None
+    if not tem_modelo:
+        st.info(t("review.needs_model"))
+        return None
+    max_itens = st.slider(t("review.max_items"), 5, 200, 50, step=5,
+                          key="conf_col_max", help=t("review.max_items_help"))
+    with st.expander(t("review.advanced")):
+        teto = max(0.02, round(conf - 0.01, 2))
+        padrao = min(teto, max(0.01, round(min(0.15, conf / 2), 2)))
+        # A chave leva o id da análise: o teto muda com o limiar de cada análise.
+        conf_captura = st.slider(t("review.suggest_conf"), 0.01, teto, padrao, 0.01,
+                                 key=f"conf_col_capt_{aid}",
+                                 help=t("review.suggest_conf_help", conf=conf))
+    coletar = st.button(t("review.collect_btn"), type="primary", key="conf_col_coletar",
+                        on_click=_marcar_ocupado)
+    st.caption(t("review.collect_hint", n=min(max_itens, restantes)))
+    return (conf_captura, max_itens) if coletar else None
+
+
+@st.fragment
+def _conf_anotacao_analise(user_id, aid):
+    """Anotador restrito aos candidatos da análise + atalho para o treino.
+
+    Fragmento: cada traço no canvas redesenha só este bloco, não o vídeo de
+    conferência acima (que seria lido do disco de novo a cada interação).
+    Salvar/validar/navegar chamam st.rerun() e redesenham a página toda.
+    """
+    b = database.candidate_breakdown(user_id, analysis_id=aid)
+    if not sum(b[k] for k in ("pendente", "validado", "reanotado", "sem_abelha",
+                              "descartado")):
+        return
+    st.divider()
+    c_txt, c_btn = st.columns([3, 1], vertical_alignment="center")
+    c_txt.markdown(t("review.counts", pending=b["pendente"], validated=b["validado"],
+                     reannotated=b["reanotado"], no_bee=b["sem_abelha"],
+                     discarded=b["descartado"]))
+    if c_btn.button(t("review.go_train"), key="conf_ir_treinar", width="stretch"):
+        st.session_state["_keep_anot_secao"] = "train"
+        st.session_state.pop("anot_secao", None)
+        go_to("annotate")
+    _anotador(user_id, "rev_anot", analysis_id=aid)
 def _box_para_rect_canvas(box, escala):
     """Caixa [x,y,w,h] (px imagem) -> objeto fabric rect (coords do canvas)."""
     x, y, w, h = box[:4]
-    return {"type": "rect", "left": x / escala, "top": y / escala,
+    return {"type": "Rect", "left": x / escala, "top": y / escala,
             "width": w / escala, "height": h / escala,
             "originX": "left", "originY": "top", "angle": 0,
             "scaleX": 1, "scaleY": 1, "strokeWidth": 2,
@@ -3074,18 +3424,63 @@ def render_anotacao(user_id):
     st.session_state["_keep_anot_secao"] = secao
 
     if secao == "label":
-        _anot_reanotar(user_id, coletados)
+        if coletados == 0:
+            st.info(t("annot.no_candidates"))
+        else:
+            _anotador(user_id, "anot")
     elif secao == "train":
         _anot_treinar(user_id, anot, n_ext)
     else:
         _anot_dados(user_id)
 
 
-def _anot_reanotar(user_id, coletados):
-    """Reanotação: um candidato por vez, com anterior/próximo e avanço automático."""
-    if coletados == 0:
-        st.info(t("annot.no_candidates"))
-        return
+def _rotulo_candidato(c):
+    """Texto do candidato no seletor 'Ir para'."""
+    area = f" · {c['area']}" if c.get("area") else ""
+    conf = (t("annot.position_conf", conf=c["pred_conf"])
+            if c.get("pred_conf") is not None else "")
+    return t("annot.candidate_label", id=c["id"], area=area,
+             frame=c["frame_index"], reason=t(f"annot.reason_{c['reason']}"),
+             conf=conf, status=_status_candidato(c))
+
+
+def _status_candidato(c):
+    """Situação legível; anotados dizem se a predição foi validada ou reanotada."""
+    txt = t(f"annot.status_{c['status']}")
+    if c.get("status") == "anotado" and c.get("label_source") in ("validado",
+                                                                   "reanotado"):
+        txt = t(f"annot.source_{c['label_source']}")
+    return txt
+
+
+def _anot_escolher(prefixo, lista, coluna):
+    """Selectbox 'Ir para' + pedido pendente de navegação; devolve o id escolhido."""
+    rotulos = {c["id"]: _rotulo_candidato(c) for c in lista}
+    ids = list(rotulos)
+    # Pedido de navegação (anterior/próximo/avanço após salvar) feito na
+    # execução anterior: aplica antes de desenhar o seletor.
+    alvo = st.session_state.pop(f"_{prefixo}_goto", None)
+    for candidato in (alvo, st.session_state.get(f"{prefixo}_sel"),
+                      st.session_state.get(f"_keep_{prefixo}_sel")):
+        if candidato in ids:
+            alvo = candidato
+            break
+    else:
+        alvo = ids[0]
+    st.session_state[f"{prefixo}_sel"] = alvo
+    escolhido = coluna.selectbox(t("annot.jump_to"), ids, key=f"{prefixo}_sel",
+                                 format_func=lambda i: rotulos.get(i, str(i)))
+    st.session_state[f"_keep_{prefixo}_sel"] = escolhido
+    return escolhido
+
+
+def _anotador(user_id, prefixo, analysis_id=None):
+    """Reanotação: um candidato por vez, com anterior/próximo e avanço automático.
+
+    Componente usado na Anotação (prefixo "anot", todos os candidatos) e na
+    Conferência (só os de `analysis_id`). Todas as chaves de widget/sessão levam
+    o `prefixo`, para as duas instâncias não colidirem.
+    """
     try:
         _patch_canvas_compat()
         from streamlit_drawable_canvas import st_canvas
@@ -3095,56 +3490,35 @@ def _anot_reanotar(user_id, coletados):
         return
 
     _filtros = ["pendente", "todos"]
-    _ult_f = st.session_state.get("_keep_anot_filtro")
+    _ult_f = st.session_state.get(f"_keep_{prefixo}_filtro")
     c_filtro, c_ir = st.columns([1, 2], vertical_alignment="bottom")
     filtro = c_filtro.segmented_control(
-        t("annot.show"), _filtros, key="anot_filtro", required=True,
+        t("annot.show"), _filtros, key=f"{prefixo}_filtro", required=True,
         default=_ult_f if _ult_f in _filtros else "pendente",
         format_func={v: t(f"annot.filter_{v}") for v in _filtros}.get)
     if filtro not in _filtros:
         filtro = "pendente"
-    st.session_state["_keep_anot_filtro"] = filtro
-    lista = database.list_candidates(user_id,
-                                     status="pendente" if filtro == "pendente" else None)
+    st.session_state[f"_keep_{prefixo}_filtro"] = filtro
+    lista = database.list_candidates(
+        user_id, status="pendente" if filtro == "pendente" else None,
+        analysis_id=analysis_id)
     if not lista:
         st.success(t("annot.all_done"))
         return
 
-    def _rotulo(c):
-        area = f" · {c['area']}" if c.get("area") else ""
-        conf = (t("annot.position_conf", conf=c["pred_conf"])
-                if c.get("pred_conf") is not None else "")
-        return t("annot.candidate_label", id=c["id"], area=area,
-                 frame=c["frame_index"], reason=t(f"annot.reason_{c['reason']}"),
-                 conf=conf, status=t(f"annot.status_{c['status']}"))
-
-    rotulos = {c["id"]: _rotulo(c) for c in lista}
-    ids = list(rotulos)
-    # Pedido de navegação (anterior/próximo/avanço após salvar) feito na
-    # execução anterior: aplica antes de desenhar o seletor.
-    alvo = st.session_state.pop("_anot_goto", None)
-    for candidato in (alvo, st.session_state.get("anot_sel"),
-                      st.session_state.get("_keep_anot_sel")):
-        if candidato in ids:
-            alvo = candidato
-            break
-    else:
-        alvo = ids[0]
-    st.session_state["anot_sel"] = alvo
-    escolhido = c_ir.selectbox(t("annot.jump_to"), ids, key="anot_sel",
-                               format_func=lambda i: rotulos.get(i, str(i)))
-    st.session_state["_keep_anot_sel"] = escolhido
+    escolhido = _anot_escolher(prefixo, lista, c_ir)
+    ids = [c["id"] for c in lista]
     pos = ids.index(escolhido)
     info = lista[pos]
 
     c_ant, c_txt, c_prox = st.columns([1, 4, 1], vertical_alignment="center")
-    if c_ant.button(t("annot.prev_btn"), key="anot_prev", width="stretch",
+    if c_ant.button(t("annot.prev_btn"), key=f"{prefixo}_prev", width="stretch",
                     disabled=pos == 0):
-        st.session_state["_anot_goto"] = ids[pos - 1]
+        st.session_state[f"_{prefixo}_goto"] = ids[pos - 1]
         st.rerun()
-    if c_prox.button(t("annot.next_btn"), key="anot_next", width="stretch",
+    if c_prox.button(t("annot.next_btn"), key=f"{prefixo}_next", width="stretch",
                      disabled=pos >= len(ids) - 1):
-        st.session_state["_anot_goto"] = ids[pos + 1]
+        st.session_state[f"_{prefixo}_goto"] = ids[pos + 1]
         st.rerun()
     area = t("annot.position_area", area=_md_esc(info["area"])) if info.get("area") else ""
     c_txt.markdown(t("annot.position", i=pos + 1, n=len(ids),
@@ -3154,7 +3528,7 @@ def _anot_reanotar(user_id, coletados):
             if info.get("pred_conf") is not None else "")
     c_txt.caption(t("annot.position_detail",
                     reason=t(f"annot.reason_{info['reason']}"), conf=conf,
-                    status=t(f"annot.status_{info['status']}")))
+                    status=_status_candidato(info)))
 
     cand = database.get_candidate(escolhido, user_id)
     if not cand or not cand.get("image_jpg"):
@@ -3171,17 +3545,16 @@ def _anot_reanotar(user_id, coletados):
     escala = largura / canvas_w
 
     # Pré-carrega caixas: labels já anotados, senão as sugestões da rede.
+    brutas = json.loads(cand["pred_boxes"]) if cand.get("pred_boxes") else []
+    sugeridas = [b[:4] for b in brutas]
+    # Confiança mostrada = a da melhor caixa sugerida (não o pred_conf, que na
+    # coleta do processamento é o score da detecção aceita da área).
+    melhor_sug = max((float(b[4]) for b in brutas if len(b) > 4), default=None)
     base = json.loads(cand["labels"]) if cand.get("labels") else None
     if not base:
-        base = [b[:4] for b in (json.loads(cand["pred_boxes"]) if cand.get("pred_boxes") else [])]
+        base = sugeridas
     init = {"version": "4.4.0",
             "objects": [_box_para_rect_canvas(b, escala) for b in (base or [])]}
-
-    def _avancar():
-        """Depois de salvar/marcar/descartar, abre o próximo pendente."""
-        prox = _proximo_pendente(lista, cand["id"])
-        if prox is not None:
-            st.session_state["_anot_goto"] = prox
 
     st.markdown(t("annot.draw_instructions"))
     col_canvas, col_acoes = st.columns([3, 1])
@@ -3190,56 +3563,148 @@ def _anot_reanotar(user_id, coletados):
             fill_color="rgba(0,224,164,0.15)", stroke_width=2, stroke_color="#00E0A4",
             background_image=pil, update_streamlit=True, initial_drawing=init,
             height=canvas_h, width=canvas_w, drawing_mode="rect",
-            key=f"canvas_anot_{cand['id']}",
+            key=f"canvas_{prefixo}_{cand['id']}",
         )
     with col_acoes:
-        st.caption(t("annot.frame_info", w=largura, h=altura))
-        if st.button(t("annot.save_btn"), type="primary", width="stretch",
-                     key="anot_salvar"):
-            objs = (canvas.json_data or {}).get("objects") if canvas else None
-            caixas = [_rect_para_box(o, escala) for o in (objs or [])
-                      if o.get("type") in ("rect", "Rect") and o.get("width")]
-            caixas = [b for b in caixas if b[2] > 1 and b[3] > 1]
-            if not caixas:
-                st.warning(t("annot.no_boxes"))
-            else:
-                database.set_candidate_labels(cand["id"], user_id, caixas, "anotado")
-                ui.flash(t("annot.boxes_saved", n=len(caixas)))
-                _avancar()
-                st.rerun()
-        if st.button(t("annot.no_bee_btn"), width="stretch", key="anot_sem_abelha"):
-            database.set_candidate_labels(cand["id"], user_id, [], "sem_abelha")
-            ui.flash(t("annot.flash_no_bee", id=cand["id"]), "info")
-            _avancar()
-            st.rerun()
-        if st.button(t("annot.discard_btn"), width="stretch", key="anot_descartar",
-                     help=t("annot.discard_help")):
-            database.set_candidate_labels(cand["id"], user_id, [], "descartado")
-            ui.flash(t("annot.flash_discarded", id=cand["id"]), "info")
-            _avancar()
-            st.rerun()
-        st.caption(t("annot.auto_advance_hint"))
+        _anot_acoes(user_id, prefixo, lista, cand, canvas, escala, sugeridas,
+                    melhor_sug, base or [], largura, altura)
+
+
+def _caixas_do_canvas(canvas, escala):
+    """Caixas [x,y,w,h] (px imagem) desenhadas no canvas; None se o canvas
+    ainda não devolveu nada (antes da primeira interação)."""
+    dados = canvas.json_data if canvas is not None else None
+    if not dados or dados.get("objects") is None:
+        return None
+    caixas = [_rect_para_box(o, escala) for o in dados["objects"]
+              if str(o.get("type", "")).lower() == "rect" and o.get("width")]
+    return [b for b in caixas if b[2] > 1 and b[3] > 1]
+
+
+def _mesmas_caixas(a, b, tol=2.0) -> bool:
+    """Mesmo conjunto de caixas (na mesma ordem), com tolerância em px."""
+    return len(a) == len(b) and all(
+        abs(float(p) - float(q)) <= tol for ca, cb in zip(a, b)
+        for p, q in zip(ca[:4], cb[:4]))
+
+
+def _anot_acoes(user_id, prefixo, lista, cand, canvas, escala, sugeridas,
+                melhor_sug, iniciais, largura, altura):
+    """Botões do anotador: validar a predição, salvar caixas, sem abelha, descartar.
+
+    Validar grava as caixas SUGERIDAS como estão; por isso só fica disponível
+    (e como botão principal) enquanto o canvas mostra exatamente as sugestões —
+    sem edições e sem rótulos anteriores diferentes delas.
+    """
+    def _concluir(msg, tipo="success"):
+        """Depois de validar/salvar/marcar/descartar, abre o próximo pendente."""
+        ui.flash(msg, tipo)
+        prox = _proximo_pendente(lista, cand["id"])
+        if prox is not None:
+            st.session_state[f"_{prefixo}_goto"] = prox
+        st.rerun()
+
+    st.caption(t("annot.frame_info", w=largura, h=altura))
+    if sugeridas:
+        st.caption(t("annot.prediction_info", n=len(sugeridas),
+                     conf=melhor_sug if melhor_sug is not None
+                     else float(cand.get("pred_conf") or 0)))
+    no_canvas = _caixas_do_canvas(canvas, escala)
+    if no_canvas is None:
+        no_canvas = iniciais
+    pode_validar = bool(sugeridas) and _mesmas_caixas(no_canvas, sugeridas)
+    if not sugeridas:
+        ajuda_validar = t("annot.validate_disabled_help")
+    elif not pode_validar:
+        ajuda_validar = t("annot.validate_edited_help")
+    else:
+        ajuda_validar = t("annot.validate_help")
+    if st.button(t("annot.validate_btn"), type="primary" if pode_validar else "secondary",
+                 width="stretch", key=f"{prefixo}_validar", disabled=not pode_validar,
+                 help=ajuda_validar):
+        database.set_candidate_labels(cand["id"], user_id, sugeridas, "anotado",
+                                      source="validado")
+        log_event("candidate_validated",
+                  f"Candidato #{cand['id']}: predição validada ({len(sugeridas)} caixa(s))",
+                  user_id=user_id, analysis_id=cand.get("analysis_id"))
+        _concluir(t("annot.flash_validated", id=cand["id"], n=len(sugeridas)))
+    if st.button(t("annot.save_btn"), type="secondary" if pode_validar else "primary",
+                 width="stretch", key=f"{prefixo}_salvar"):
+        caixas = _caixas_do_canvas(canvas, escala) or []
+        if not caixas:
+            st.warning(t("annot.no_boxes"))
+        else:
+            database.set_candidate_labels(cand["id"], user_id, caixas, "anotado",
+                                          source="reanotado")
+            log_event("candidate_reannotated",
+                      f"Candidato #{cand['id']}: reanotado ({len(caixas)} caixa(s))",
+                      user_id=user_id, analysis_id=cand.get("analysis_id"))
+            _concluir(t("annot.boxes_saved", n=len(caixas)))
+    if st.button(t("annot.no_bee_btn"), width="stretch", key=f"{prefixo}_sem_abelha"):
+        database.set_candidate_labels(cand["id"], user_id, [], "sem_abelha")
+        _concluir(t("annot.flash_no_bee", id=cand["id"]), "info")
+    if st.button(t("annot.discard_btn"), width="stretch", key=f"{prefixo}_descartar",
+                 help=t("annot.discard_help")):
+        database.set_candidate_labels(cand["id"], user_id, [], "descartado")
+        _concluir(t("annot.flash_discarded", id=cand["id"]), "info")
+    if sugeridas:
+        st.caption(t("annot.validate_note"))
+    st.caption(t("annot.auto_advance_hint"))
 
 
 def _aplicar_perfil_treino():
     """on_change do perfil: leva o preset para os controles avançados."""
     p = PERFIS_TREINO.get(st.session_state.get("train_perfil"))
     if p:
-        st.session_state["train_base"] = p["base"]
+        # Um modelo treinado/ativo escolhido como base (continuar o retreino)
+        # é mantido; só os modelos base do Ultralytics seguem o perfil.
+        if st.session_state.get("train_base") in (None, *MODELOS_BASE):
+            st.session_state["train_base"] = p["base"]
         st.session_state["train_epochs"] = p["epochs"]
         st.session_state["train_imgsz"] = p["imgsz"]
 
 
+def _composicao_dataset(user_id) -> str:
+    """Linha com a composição das imagens rotuladas (validadas/reanotadas/negativas)."""
+    b = database.candidate_breakdown(user_id)
+    return t("annot.dataset_breakdown", validated=b["validado"],
+             reannotated=b["reanotado"], negatives=b["sem_abelha"],
+             review=b["conferencia"])
+
+
+def _modelos_base_treino() -> dict:
+    """{caminho/nome: rótulo} dos pontos de partida do treino.
+
+    Os modelos base do Ultralytics (baixados na 1ª vez), os modelos já treinados
+    no app (beemove_*.pt, mais recentes primeiro) e o modelo ativo, quando .pt —
+    assim um retreino pode continuar a partir do modelo atual.
+    """
+    _, ativo = modelo_ativo()
+    opcoes = {m: t("annot.base_pretrained", name=m) for m in MODELOS_BASE}
+    try:
+        treinados = sorted(_TRAINED_DIR.glob("beemove_*.pt"),
+                           key=lambda q: q.stat().st_mtime, reverse=True)
+    except Exception:
+        treinados = []
+    caminhos = [str(q) for q in treinados]
+    if str(ativo).endswith(".pt") and os.path.exists(ativo) and str(ativo) not in caminhos:
+        caminhos.insert(0, str(ativo))
+    for c in caminhos:
+        nome = os.path.basename(c)
+        opcoes[c] = (t("annot.base_active", name=nome) if c == str(ativo)
+                     else t("annot.base_trained", name=nome))
+    return opcoes
+
+
 def _anot_treinar(user_id, n_anotados, n_ext):
     """Treino (fine-tuning Ultralytics): perfil simples + controles avançados."""
-    import traceback
-
     if not _ultralytics_disponivel():
         st.warning(t("annot.no_ultralytics"))
         return
     total_imgs = n_anotados + n_ext
     st.markdown(t("annot.train_caption", n_reannot=n_anotados, n_ext=n_ext,
                   total=total_imgs))
+    st.caption(_composicao_dataset(user_id))
     disp, nome_gpu = dispositivo_treino()
     if disp == "gpu":
         st.info(t("annot.train_on_gpu", name=nome_gpu or "CUDA"))
@@ -3261,36 +3726,47 @@ def _anot_treinar(user_id, n_anotados, n_ext):
     st.caption(t(f"annot.profile_{perfil}_desc"))
 
     preset = PERFIS_TREINO[perfil]
-    validos = {"train_base": MODELOS_BASE, "train_imgsz": [320, 416, 512, 640]}
+    bases = _modelos_base_treino()
+    validos = {"train_base": list(bases), "train_imgsz": [320, 416, 512, 640]}
     for k, v in (("train_base", preset["base"]), ("train_epochs", preset["epochs"]),
                  ("train_imgsz", preset["imgsz"])):
         atual = st.session_state.get(k)
         if atual is None or (k in validos and atual not in validos[k]):
             st.session_state[k] = v
     with st.expander(t("annot.advanced")):
-        base = st.selectbox(t("annot.base_model"), MODELOS_BASE, key="train_base",
+        base = st.selectbox(t("annot.base_model"), list(bases), key="train_base",
+                            format_func=lambda b: bases.get(b, os.path.basename(b)),
                             help=t("annot.base_model_help"))
         cep, cimg = st.columns(2)
         epochs = cep.slider(t("annot.epochs"), 10, 300, step=10, key="train_epochs",
                             help=t("annot.epochs_help"))
         imgsz = cimg.select_slider(t("annot.imgsz"), [320, 416, 512, 640],
                                    key="train_imgsz", help=t("annot.imgsz_help"))
-    st.caption(t("annot.train_summary", base=base, epochs=epochs, imgsz=imgsz))
+    st.caption(t("annot.train_summary", base=os.path.basename(base), epochs=epochs,
+                 imgsz=imgsz))
 
     if total_imgs < 5:
         st.info(t("annot.need_more_images"))
-        return
-    st.warning(t("annot.train_keep_page_open"))
-    if not st.button(t("annot.train_btn"), type="primary", key="train_go"):
-        return
+    else:
+        st.warning(t("annot.train_keep_page_open"))
+        if st.button(t("annot.train_btn"), type="primary", key="train_go"):
+            _anot_executar_treino(user_id, base, epochs, imgsz)
+    _anot_resultado_treino(user_id)
 
+
+def _anot_executar_treino(user_id, base, epochs, imgsz):
+    """Roda o treino; o modelo novo fica em session_state p/ o resultado (e a ativação)."""
+    import traceback
+
+    st.session_state.pop("_anot_treino_novo", None)
     destino = erro = None
     with st.status(t("annot.training_status"), expanded=True) as caixa:
         barra = st.progress(0.0, text=t("annot.training_preparing"))
         try:
             destino, ni, nc = treinar_modelo(user_id, base, epochs, imgsz, barra)
             log_event("model_trained",
-                      f"Treino Ultralytics: {destino.name} ({ni} imgs, {nc} caixas)",
+                      f"Treino Ultralytics: {destino.name} ({ni} imgs, {nc} caixas, "
+                      f"base {os.path.basename(str(base))})",
                       user_id=user_id)
             caixa.update(label=t("annot.training_done_status"), state="complete",
                          expanded=False)
@@ -3306,15 +3782,32 @@ def _anot_treinar(user_id, n_anotados, n_ext):
 
     if erro is not None:
         tipo = erro_treino_amigavel(erro)
-        st.error(t(f"annot.train_err_{tipo}", base=base))
+        st.error(t(f"annot.train_err_{tipo}", base=os.path.basename(str(base))))
         with st.expander(t("annot.train_error_details")):
             st.code(detalhe, language=None)
     elif destino is not None and destino.exists():
-        chave = ("annot.train_ok_admin" if st.session_state.get("role") == "admin"
-                 else "annot.train_ok_user")
-        st.success(t(chave, name=destino.name))
+        st.session_state["_anot_treino_novo"] = str(destino)
     else:
         st.error(t("annot.train_no_file"))
+
+
+def _anot_resultado_treino(user_id):
+    """Resultado do último treino da sessão; admins podem ativar o modelo já aqui."""
+    caminho = st.session_state.get("_anot_treino_novo")
+    if not caminho or not os.path.exists(caminho):
+        return
+    nome = os.path.basename(caminho)
+    if st.session_state.get("role") != "admin":
+        st.success(t("annot.train_ok_user", name=nome))
+        return
+    st.success(t("annot.train_ok_admin", name=nome))
+    if os.path.abspath(modelo_ativo()[1]) == os.path.abspath(caminho):
+        st.caption(t("annot.trained_is_active", name=nome))
+    elif st.button(t("annot.activate_trained_btn"), type="primary",
+                   key="train_ativar_novo"):
+        ativar_modelo(caminho, "", user_id, evento="model_activated")
+        ui.flash(t("admin.model_activated", name=nome))
+        st.rerun()
 
 
 def _relatorio_importacao(r):
@@ -3376,6 +3869,7 @@ def _anot_dados(user_id):
         res = dataset.resumo(anotados)
         st.caption(t("annot.export_caption", n_img=res["imagens"],
                      n_box=res["caixas"], n_neg=res["negativas"]))
+        st.caption(_composicao_dataset(user_id))
         if res["imagens"] == 0:
             st.info(t("annot.export_empty"))
             return
@@ -3617,11 +4111,7 @@ def _admin_modelos(current_user_id, input_size, usar_gpu, fp16, nms, class_names
     if c_btn.button(t("admin.activate_selected"), type="primary",
                     key="admin_aplicar_modelo", width="stretch",
                     disabled=escolhido is None or ja_ativo):
-        database.set_setting("active_weights", escolhido["weights"])
-        database.set_setting("active_cfg", escolhido["cfg"])
-        carregar_modelo.clear()   # invalida o cache p/ recarregar os novos pesos
-        log_event("model_selected", f"Modelo ativo: {escolhido['nome']}",
-                  user_id=current_user_id)
+        ativar_modelo(escolhido["weights"], escolhido["cfg"], current_user_id)
         ui.flash(t("admin.model_activated", name=escolhido["nome"]))
         st.rerun()
     if escolhido is None:
@@ -4059,7 +4549,7 @@ if pagina == "new":
 elif pagina == "history":
     render_historico(user_id, username, limiar_parada_px)
 elif pagina == "review":
-    render_conferencia()
+    render_conferencia(user_id, model, class_names)
 elif pagina == "annotate":
     render_anotacao(user_id)
 elif pagina == "admin" and is_admin:
