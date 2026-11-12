@@ -256,6 +256,10 @@ def checar_processamento(uid, caminho) -> list[str]:
         falhas.append("estado vazio: dicas de gravação não apareceram")
 
     # detecção automática de placas: cria as áreas e reabre o canvas sem erro
+    def chave_nome0(at):
+        ger = at.session_state["_zonas_geracao"] if "_zonas_geracao" in at.session_state else 0
+        return f"zona_nome_{ger}_0"
+
     placas = str(TMP / "placas.mp4")
     vw = cv2.VideoWriter(placas, cv2.VideoWriter_fourcc(*"mp4v"), 10, (600, 300))
     for _ in range(20):
@@ -281,15 +285,39 @@ def checar_processamento(uid, caminho) -> list[str]:
             falhas.append(f"detectar placas: {n} área(s) criada(s), esperado 2")
         # renomear e detectar de novo com outro prefixo: os campos de nome não
         # podem devolver os nomes antigos (text_input com key ignora value=)
-        at.text_input(key="zona_nome_0").set_value("Controle").run()
+        at.text_input(key=chave_nome0(at)).set_value("Controle").run()
         at.text_input(key="zonas_prefixo").set_value("Dish").run()
         [b for b in at.button if b.label == "🔍 Detect dishes"][0].click().run()
         sem_erros(at, "detectar placas de novo")
         nomes = [z["name"] for z in at.session_state["zones"]]
         if nomes != ["Dish 1", "Dish 2"]:
             falhas.append(f"detectar de novo: nomes {nomes}, esperado ['Dish 1', 'Dish 2']")
-        if at.text_input(key="zona_nome_0").value != "Dish 1":
+        if at.text_input(key=chave_nome0(at)).value != "Dish 1":
             falhas.append("detectar de novo: o campo do nome manteve o nome antigo")
+        # as placas guardam a geometria de elipse (para voltar editáveis)
+        if not all((z.get("forma") or {}).get("tipo") == "elipse"
+                   for z in at.session_state["zones"]):
+            falhas.append("detectar placas: áreas sem a geometria de elipse")
+        # 🗑️ exclui só aquela área e mantém o nome da outra
+        at.text_input(key=chave_nome0(at)).set_value("Controle").run()
+        at.button(key="zona_excluir_1").click().run()
+        sem_erros(at, "excluir área")
+        nomes = [z["name"] for z in at.session_state["zones"]]
+        if nomes != ["Controle"]:
+            falhas.append(f"excluir área: nomes {nomes}, esperado ['Controle']")
+        if at.text_input(key=chave_nome0(at)).value != "Controle":
+            falhas.append("excluir área: o campo do nome perdeu o nome")
+        # sair da ferramenta e voltar: as áreas continuam e o formato também
+        at.radio(key="zona_formato").set_value("polygon").run()
+        at.segmented_control(key="ferramenta_desenho").set_value("none").run()
+        at.segmented_control(key="ferramenta_desenho").set_value("zones").run()
+        sem_erros(at, "voltar à ferramenta de áreas")
+        if len(at.session_state["zones"]) != 1:
+            falhas.append("voltar à ferramenta: as áreas sumiram")
+        if at.radio(key="zona_formato").value != "polygon":
+            falhas.append("voltar à ferramenta: o formato da área não foi mantido")
+        if any("not saved" in w.value for w in at.warning):
+            falhas.append("voltar à ferramenta: aviso de alteração não salva sem mudança")
     except Exception as e:
         falhas.append(f"detectar placas: {type(e).__name__}: {e}")
 

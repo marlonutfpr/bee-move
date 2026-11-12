@@ -1829,6 +1829,53 @@ def ferramenta_calibracao(video_path):
         st.caption(t("calib.no_scale"))
 
 
+_ORIGEM = {"left": 0.0, "top": 0.0, "center": 0.5, "right": 1.0, "bottom": 1.0}
+_COR_ZONA = {"stroke": "#FFA500", "fill": "rgba(255,165,0,0.25)", "strokeWidth": 2}
+
+
+def _elipse_do_objeto(obj):
+    """(cx, cy, rx, ry, ângulo°) em coords do CANVAS de um círculo/elipse do
+    fabric.js, ou None se o objeto não for um.
+
+    O CircleTool do streamlit-drawable-canvas usa o ponto do clique como ORIGEM
+    (originX="left", originY="center" → ponto na circunferência) e GIRA o
+    círculo por `angle` na direção do arraste; depois de editado ele também
+    pode ter scaleX ≠ scaleY (elipse). Logo o centro é a origem mais a meia
+    caixa (com o traço) girada por `angle` — a fórmula geral do fabric.
+    """
+    tipo = str(obj.get("type", "")).lower()
+    sx = float(obj.get("scaleX") or 1.0)
+    sy = float(obj.get("scaleY") or 1.0)
+    if tipo == "circle":
+        raio = float(obj.get("radius") or 0.0)
+        rx0 = ry0 = raio
+    elif tipo == "ellipse":
+        rx0, ry0 = float(obj.get("rx") or 0.0), float(obj.get("ry") or 0.0)
+    else:
+        return None
+    sw = float(obj.get("strokeWidth") or 0.0)
+    ang_graus = float(obj.get("angle") or 0.0)
+    ang = np.radians(ang_graus)
+    ca, sa = np.cos(ang), np.sin(ang)
+    dx = (0.5 - _ORIGEM.get(obj.get("originX", "left"), 0.0)) * (2 * rx0 + sw) * sx
+    dy = (0.5 - _ORIGEM.get(obj.get("originY", "top"), 0.0)) * (2 * ry0 + sw) * sy
+    left, top = float(obj.get("left") or 0.0), float(obj.get("top") or 0.0)
+    return (left + dx * ca - dy * sa, top + dx * sa + dy * ca,
+            rx0 * sx, ry0 * sy, ang_graus)
+
+
+def _forma_do_objeto(obj, escala):
+    """Geometria (px da IMAGEM) de um círculo/elipse do canvas, guardada na
+    área para recarregá-la no canvas como forma editável; None p/ polígonos
+    (esses se recriam a partir dos próprios vértices)."""
+    elipse = _elipse_do_objeto(obj)
+    if elipse is None:
+        return None
+    cx, cy, rx, ry, ang = elipse
+    return {"tipo": "elipse", "cx": float(cx * escala), "cy": float(cy * escala),
+            "rx": float(rx * escala), "ry": float(ry * escala), "angulo": float(ang)}
+
+
 def _poligono_do_objeto(obj, escala, n_circulo=40):
     """Extrai os vértices (em px da imagem) de um objeto do canvas (fabric.js).
 
@@ -1838,39 +1885,40 @@ def _poligono_do_objeto(obj, escala, n_circulo=40):
     Coordenadas do canvas são multiplicadas por `escala` (canvas -> imagem).
     """
     pts = []
-    tipo = obj.get("type")
-    if tipo in ("circle", "Circle"):
-        left, top = obj.get("left", 0.0), obj.get("top", 0.0)
-        raio = obj.get("radius", 0.0)
-        sx, sy = obj.get("scaleX", 1.0), obj.get("scaleY", 1.0)
-        rx, ry = raio * sx, raio * sy
-        # O CircleTool do streamlit-drawable-canvas usa o ponto do clique como
-        # ORIGEM (originX="left", originY="center" → ponto na circunferência) e
-        # ROTACIONA o círculo por `angle` (graus) na direção do arraste. Logo o
-        # centro NÃO é (left+rx, top): é a origem mais o vetor (offset_local)
-        # girado por `angle`. Honramos origin + rotação (fórmula geral do fabric).
-        ox = obj.get("originX", "left")
-        oy = obj.get("originY", "center")
-        off_x = 0.0 if ox == "center" else (-rx if ox == "right" else rx)
-        off_y = 0.0 if oy == "center" else (-ry if oy == "bottom" else ry)
-        ang = np.radians(obj.get("angle", 0.0) or 0.0)
+    tipo = str(obj.get("type", "")).lower()
+    elipse = _elipse_do_objeto(obj)
+    if elipse is not None:
+        cx, cy, rx, ry, ang_graus = elipse
+        ang = np.radians(ang_graus)
         ca, sa = np.cos(ang), np.sin(ang)
-        cx = left + off_x * ca - off_y * sa
-        cy = top + off_x * sa + off_y * ca
         for k in range(n_circulo):
             th = 2.0 * np.pi * k / n_circulo
             ex, ey = rx * np.cos(th), ry * np.sin(th)  # ponto na elipse (eixos locais)
             pts.append([(cx + ex * ca - ey * sa) * escala,
                         (cy + ex * sa + ey * ca) * escala])
-    elif tipo in ("polygon", "Polygon") and obj.get("points"):
+    elif tipo == "polygon" and obj.get("points"):
         left, top = obj.get("left", 0.0), obj.get("top", 0.0)
-        sx, sy = obj.get("scaleX", 1.0), obj.get("scaleY", 1.0)
+        sx = float(obj.get("scaleX") or 1.0)
+        sy = float(obj.get("scaleY") or 1.0)
+        # O fabric põe left/top na borda da caixa INCLUINDO meio traço
+        # (left = min(x) - strokeWidth/2): descontamos para os vértices ficarem
+        # exatos e a área não "andar" a cada salvar/recarregar.
+        sw = float(obj.get("strokeWidth") or 0.0)
         xs = [p["x"] for p in obj["points"]]
         ys = [p["y"] for p in obj["points"]]
-        minx, miny = min(xs), min(ys)
+        minx, miny, maxx, maxy = min(xs), min(ys), max(xs), max(ys)
+        # Centro do objeto = origem + (meia caixa, com traço) girada por angle;
+        # cada vértice = centro + (ponto - centro dos pontos) escalado e girado.
+        ang = np.radians(float(obj.get("angle") or 0.0))
+        ca, sa = np.cos(ang), np.sin(ang)
+        dx = (0.5 - _ORIGEM.get(obj.get("originX", "left"), 0.0)) * (maxx - minx + sw) * sx
+        dy = (0.5 - _ORIGEM.get(obj.get("originY", "top"), 0.0)) * (maxy - miny + sw) * sy
+        cx, cy = left + dx * ca - dy * sa, top + dx * sa + dy * ca
+        mx, my = (minx + maxx) / 2.0, (miny + maxy) / 2.0
         for p in obj["points"]:
-            pts.append([(left + (p["x"] - minx) * sx) * escala,
-                        (top + (p["y"] - miny) * sy) * escala])
+            lx, ly = (p["x"] - mx) * sx, (p["y"] - my) * sy
+            pts.append([(cx + lx * ca - ly * sa) * escala,
+                        (cy + lx * sa + ly * ca) * escala])
     elif obj.get("path"):
         for seg in obj["path"]:
             if len(seg) >= 3 and isinstance(seg[1], (int, float)):
@@ -1884,25 +1932,74 @@ def _circulo_para_poligono(cx, cy, r, n=40):
              float(cy + r * np.sin(2 * np.pi * k / n))] for k in range(n)]
 
 
-def _circulos_para_canvas(circulos, escala):
-    """Monta um initial_drawing (fabric.js) com os círculos para o canvas.
+def _forma_circulo(cx, cy, r):
+    """Geometria de elipse (px da imagem) de um círculo (cx, cy, r)."""
+    return {"tipo": "elipse", "cx": float(cx), "cy": float(cy),
+            "rx": float(r), "ry": float(r), "angulo": 0.0}
 
-    `circulos` = lista de (cx, cy, r) em px da IMAGEM; dividimos por `escala`
-    para o espaço do canvas. originX/originY="center" faz `left`/`top` ser o
-    centro — o parser `_poligono_do_objeto` lê de volta sem ambiguidade — e o
-    usuário pode mover/excluir/redimensionar cada forma antes de salvar.
+
+def _zonas_para_canvas(zonas, escala):
+    """initial_drawing (fabric.js) com as áreas JÁ definidas, como formas
+    editáveis: assim, ao voltar à ferramenta, o usuário vê e corrige (move,
+    redimensiona, gira, exclui) o que salvou, em vez de um canvas vazio.
+
+    Áreas com geometria de elipse ("forma") voltam como Circle com
+    scaleX/scaleY (= elipse) e origem no centro — `_elipse_do_objeto` lê de
+    volta sem ambiguidade; as demais voltam como Polygon dos vértices.
+    Coordenadas da imagem são divididas por `escala` (imagem -> canvas). Nome
+    de classe ("Circle", "Polygon"): é como o Fabric 6 do canvas as registra.
     """
-    objetos = [
-        # Nome de classe ("Circle"): o Fabric 6 do canvas ≥0.12 registra as
-        # classes assim, e o Fabric 4 do 0.9 também aceita (capitaliza o tipo).
-        {"type": "Circle",
-         "left": cx / escala, "top": cy / escala, "radius": r / escala,
-         "originX": "center", "originY": "center", "angle": 0,
-         "scaleX": 1, "scaleY": 1, "strokeWidth": 2,
-         "stroke": "#FFA500", "fill": "rgba(255,165,0,0.25)"}
-        for cx, cy, r in circulos
-    ]
-    return {"version": "4.4.0", "objects": objetos}
+    objetos = []
+    for z in zonas or []:
+        f = z.get("forma") or {}
+        if f.get("tipo") == "elipse" and float(f.get("rx") or 0) > 0:
+            rx, ry = float(f["rx"]), float(f.get("ry") or f["rx"])
+            objetos.append({
+                "type": "Circle", "left": f["cx"] / escala, "top": f["cy"] / escala,
+                "radius": rx / escala, "scaleX": 1, "scaleY": ry / rx,
+                "angle": float(f.get("angulo") or 0.0),
+                "originX": "center", "originY": "center", **_COR_ZONA})
+            continue
+        pts = z.get("points") or []
+        if len(pts) < 3:
+            continue
+        pontos = [{"x": float(x) / escala, "y": float(y) / escala} for x, y in pts]
+        meio = _COR_ZONA["strokeWidth"] / 2.0
+        objetos.append({
+            "type": "Polygon", "points": pontos,
+            "left": min(p["x"] for p in pontos) - meio,
+            "top": min(p["y"] for p in pontos) - meio,
+            "originX": "left", "originY": "top", "angle": 0,
+            "scaleX": 1, "scaleY": 1, **_COR_ZONA})
+    return {"version": "6.0.0", "objects": objetos}
+
+
+def _zonas_do_canvas(objetos, escala, prefixo):
+    """Áreas (px da imagem) a partir dos objetos do canvas, com a geometria
+    de elipse quando a forma é um círculo/elipse."""
+    zonas = []
+    for o in objetos or []:
+        pts = _poligono_do_objeto(o, escala)
+        if len(pts) < 3:
+            continue
+        z = {"name": f"{prefixo} {len(zonas) + 1}", "points": pts}
+        forma = _forma_do_objeto(o, escala)
+        if forma:
+            z["forma"] = forma
+        zonas.append(z)
+    return zonas
+
+
+def _mesmas_zonas(a, b, tol=1.5):
+    """True se as duas listas de áreas têm a mesma geometria (±`tol` px)."""
+    if len(a or []) != len(b or []):
+        return False
+    for za, zb in zip(a or [], b or []):
+        pa = np.asarray(za.get("points") or [], float).reshape(-1, 2)
+        pb = np.asarray(zb.get("points") or [], float).reshape(-1, 2)
+        if pa.shape != pb.shape or not np.allclose(pa, pb, atol=tol):
+            return False
+    return True
 
 
 def _detectar_placas_hough(frame, n_placas, param2=30,
@@ -2112,16 +2209,36 @@ def _modo_ajuste_canvas():
     return next((m for m in ("transform", "edit") if m in validos), None)
 
 
-def _sincronizar_nomes_zonas(zonas):
-    """Alinha os campos de nome das áreas (zona_nome_i) às áreas recriadas.
+def _chave_nome_zona(i):
+    """Key do campo de nome da área `i` na geração atual das áreas."""
+    return f"zona_nome_{st.session_state.get('_zonas_geracao', 0)}_{i}"
+
+
+def _sincronizar_nomes_zonas(zonas=None):
+    """Faz os campos de nome das áreas recomeçarem dos nomes das áreas recriadas.
 
     Um text_input com key ignora `value=` depois de criado: sem isto, ao
-    recriar as áreas (detectar, salvar, limpar) os campos devolveriam os nomes
-    antigos e sobrescreveriam os novos. Chamar antes de desenhar os campos."""
-    for k in [k for k in st.session_state if str(k).startswith("zona_nome_")]:
-        del st.session_state[k]
-    for i, z in enumerate(zonas or []):
-        st.session_state[f"zona_nome_{i}"] = z["name"]
+    recriar as áreas (detectar, salvar, excluir, limpar) os campos devolveriam
+    os nomes antigos. Em vez de reescrever o estado dos widgets (o que falha
+    quando o campo não está na tela), troca a "geração" das keys: os campos
+    novos nascem com value = nome da área."""
+    st.session_state["_zonas_geracao"] = st.session_state.get("_zonas_geracao", 0) + 1
+
+
+def _excluir_zona(indice):
+    """Callback do 🗑️ de uma área: remove-a mantendo os nomes das demais.
+
+    Roda como on_click (antes do script): lê os nomes digitados até agora."""
+    zonas = list(st.session_state.get("zones") or [])
+    for i, z in enumerate(zonas):
+        nome = st.session_state.get(_chave_nome_zona(i))
+        if nome:
+            z["name"] = nome
+    if 0 <= indice < len(zonas):
+        removida = zonas.pop(indice)
+        ui.flash(t("analysis.zone_deleted", nome=removida.get("name") or indice + 1))
+    st.session_state["zones"] = zonas
+    _sincronizar_nomes_zonas(zonas)
 
 
 def ferramenta_zonas(video_path):
@@ -2178,10 +2295,10 @@ def ferramenta_zonas(video_path):
             prefixo = (st.session_state.get("zonas_prefixo")
                        or t("analysis.zone_name_default"))
             st.session_state["zones"] = [
-                {"name": f"{prefixo} {i + 1}", "points": _circulo_para_poligono(cx, cy, r)}
+                {"name": f"{prefixo} {i + 1}", "points": _circulo_para_poligono(cx, cy, r),
+                 "forma": _forma_circulo(cx, cy, r)}
                 for i, (cx, cy, r) in enumerate(circulos)
             ]
-            st.session_state["zonas_hough_circ"] = circulos
             _sincronizar_nomes_zonas(st.session_state["zones"])
             st.session_state["zona_forcar_ajuste"] = True  # já entra no modo ajustar
             ui.flash(t("analysis.hough_found", n=len(circulos), save=rotulo_salvar))
@@ -2205,6 +2322,12 @@ def ferramenta_zonas(video_path):
         st.session_state.pop("zona_formato", None)  # valor antigo (rótulo)
     if st.session_state.pop("zona_forcar_ajuste", False):
         st.session_state["zona_formato"] = "transform" if modo_ajuste else "circle"
+    # O Streamlit apaga o estado do rádio quando a ferramenta sai da tela;
+    # restauramos a última escolha para não voltar sempre para "Polígono".
+    if "zona_formato" not in st.session_state:
+        _ult = st.session_state.get("_keep_zona_formato")
+        if _ult in _formatos:
+            st.session_state["zona_formato"] = _ult
 
     formato = st.radio(
         t("analysis.zone_shape"), list(_formatos), format_func=_formatos.get,
@@ -2212,6 +2335,7 @@ def ferramenta_zonas(video_path):
     )
     if formato not in _formatos:
         formato = "circle"
+    st.session_state["_keep_zona_formato"] = formato
     modo = modo_ajuste if formato == "transform" else formato
     if formato == "polygon":
         st.markdown(t("analysis.help_polygon"))
@@ -2220,15 +2344,18 @@ def ferramenta_zonas(video_path):
     else:
         st.markdown(t("analysis.help_adjust"))
     if not modo_ajuste:
-        st.caption(t("analysis.help_toolbar_edit"))
+        # A barra do canvas só aparece com o mouse sobre a imagem: explicar
+        # onde fica o lápis é o que torna a edição descobrível.
+        st.info(t("analysis.help_toolbar_edit"), icon="✏️")
 
     canvas_w = max(1, min(largura, CANVAS_MAX_W))
     canvas_h = int(altura * canvas_w / largura)
     escala = largura / canvas_w
 
-    # Placas detectadas por Hough são injetadas no canvas para ajuste manual.
-    circ_hough = st.session_state.get("zonas_hough_circ")
-    init_draw = _circulos_para_canvas(circ_hough, escala) if circ_hough else None
+    # As áreas já definidas (desenhadas, salvas ou detectadas por Hough) voltam
+    # ao canvas como formas editáveis — inclusive depois de trocar de
+    # ferramenta ou de tela, quando o canvas é recriado vazio.
+    init_draw = _zonas_para_canvas(zonas, escala)
 
     canvas = st_canvas(
         fill_color="rgba(255,165,0,0.25)", stroke_width=2, stroke_color="#FFA500",
@@ -2244,25 +2371,27 @@ def ferramenta_zonas(video_path):
     with col_limpar:
         limpar = st.button(t("analysis.clear_zones"), disabled=not zonas,
                            width="stretch")
+    objetos = (canvas.json_data or {}).get("objects") if canvas else None
+    no_canvas = _zonas_do_canvas(objetos, escala, prefixo)
     if salvar:
-        objetos = (canvas.json_data or {}).get("objects") if canvas else None
-        poligonos = [p for o in (objetos or [])
-                     if len(p := _poligono_do_objeto(o, escala)) >= 3]
-        if not poligonos:
+        if not no_canvas:
             st.error(t("analysis.draw_zone_first"))
         else:
-            st.session_state["zones"] = [
-                {"name": f"{prefixo} {i + 1}", "points": p}
-                for i, p in enumerate(poligonos)
-            ]
+            # Mesma quantidade de áreas → é um ajuste: preserva os nomes dados.
+            if len(no_canvas) == len(zonas):
+                for z_novo, z_ant in zip(no_canvas, zonas):
+                    z_novo["name"] = z_ant.get("name") or z_novo["name"]
+            st.session_state["zones"] = no_canvas
             _sincronizar_nomes_zonas(st.session_state["zones"])
-            ui.flash(t("analysis.zones_saved", n=len(poligonos)))
+            ui.flash(t("analysis.zones_saved", n=len(no_canvas)))
             st.rerun()
     if limpar:
         st.session_state.pop("zones", None)
-        st.session_state.pop("zonas_hough_circ", None)
         _sincronizar_nomes_zonas(None)
         st.rerun()
+
+    if not _mesmas_zonas(no_canvas, zonas):
+        st.warning(t("analysis.zones_unsaved", save=rotulo_salvar), icon="⚠️")
 
     if zonas:
         # O canvas acima já mostra as áreas sobre o frame — não repetir o preview.
@@ -2271,12 +2400,12 @@ def ferramenta_zonas(video_path):
             cols_nomes = st.columns(3)
             for j, z in enumerate(zonas[ini:ini + 3]):
                 i = ini + j
-                chave = f"zona_nome_{i}"
-                # Com o nome já na sessão (_sincronizar_nomes_zonas), não passa
-                # `value=`: o Streamlit avisaria do valor duplicado.
-                inicial = {} if chave in st.session_state else {"value": z["name"]}
-                z["name"] = cols_nomes[j].text_input(
-                    t("analysis.zone_n", n=i + 1), key=chave, **inicial)
+                c_nome, c_del = cols_nomes[j].columns([5, 1], vertical_alignment="bottom")
+                z["name"] = c_nome.text_input(
+                    t("analysis.zone_n", n=i + 1), value=z["name"],
+                    key=_chave_nome_zona(i))
+                c_del.button("🗑️", key=f"zona_excluir_{i}", on_click=_excluir_zona,
+                             args=(i,), help=t("analysis.zone_delete"))
     else:
         st.caption(t("analysis.no_zones_global"))
 
