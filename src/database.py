@@ -299,7 +299,8 @@ def list_analyses(user_id: int) -> list[dict]:
             """SELECT id, created_at, video_name, video_size_bytes,
                       frame_skip, input_size, conf_threshold, nms_threshold, backend,
                       fps_video, total_frames, frames_processed, detections,
-                      distance_px, avg_speed_px_s, processing_time_s, fps_processing
+                      distance_px, avg_speed_px_s, processing_time_s, fps_processing,
+                      pixels_per_mm, num_targets
                FROM analyses WHERE user_id = ? ORDER BY created_at DESC, id DESC""",
             (user_id,),
         ).fetchall()

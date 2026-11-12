@@ -12,6 +12,7 @@ import secrets
 
 import database
 from app_logging import log_event
+from i18n import t
 
 PBKDF2_ITERATIONS = 240_000
 MIN_USERNAME = 3
@@ -41,16 +42,16 @@ def register(username: str, password: str) -> tuple[bool, str]:
     """Cria uma conta. Retorna (sucesso, mensagem para o usuário)."""
     username = username.strip()
     if len(username) < MIN_USERNAME:
-        return False, f"O usuário precisa ter ao menos {MIN_USERNAME} caracteres."
+        return False, t("auth.username_too_short", n=MIN_USERNAME)
     if len(password) < MIN_PASSWORD:
-        return False, f"A senha precisa ter ao menos {MIN_PASSWORD} caracteres."
+        return False, t("auth.password_too_short", n=MIN_PASSWORD)
 
     user_id = database.create_user(username, hash_password(password))
     if user_id is None:
-        return False, "Este nome de usuário já está em uso."
+        return False, t("auth.username_taken")
 
     log_event("user_register", f"Novo usuário registrado: '{username}'", user_id=user_id)
-    return True, "Conta criada com sucesso! Faça login na aba 'Entrar'."
+    return True, t("auth.account_created")
 
 
 def login(username: str, password: str) -> tuple[dict | None, str]:
@@ -60,7 +61,7 @@ def login(username: str, password: str) -> tuple[dict | None, str]:
     if user is None or not verify_password(password, user["password_hash"]):
         log_event("login_failed", f"Tentativa de login inválida para '{username}'",
                   level=logging.WARNING)
-        return None, "Usuário ou senha inválidos."
+        return None, t("auth.invalid_credentials")
 
     database.touch_last_login(user["id"])
     log_event("login", f"Login de '{username}'", user_id=user["id"])
@@ -71,14 +72,14 @@ def change_password(user_id: int, atual: str, nova: str) -> tuple[bool, str]:
     """Troca a senha do próprio usuário (exige a senha atual)."""
     user = database.get_user_by_id(user_id)
     if user is None:
-        return False, "Usuário não encontrado."
+        return False, t("auth.user_not_found")
     if not verify_password(atual, user["password_hash"]):
-        return False, "A senha atual está incorreta."
+        return False, t("auth.current_password_wrong")
     if len(nova) < MIN_PASSWORD:
-        return False, f"A nova senha precisa ter ao menos {MIN_PASSWORD} caracteres."
+        return False, t("auth.new_password_too_short", n=MIN_PASSWORD)
     database.set_password(user_id, hash_password(nova))
     log_event("password_changed", "Senha alterada pelo próprio usuário", user_id=user_id)
-    return True, "Senha alterada com sucesso."
+    return True, t("auth.password_changed")
 
 
 # --- Operações de administrador ---
@@ -86,49 +87,49 @@ def change_password(user_id: int, atual: str, nova: str) -> tuple[bool, str]:
 def admin_create_user(username: str, password: str, role: str = "user") -> tuple[bool, str]:
     username = username.strip()
     if len(username) < MIN_USERNAME:
-        return False, f"O usuário precisa ter ao menos {MIN_USERNAME} caracteres."
+        return False, t("auth.username_too_short", n=MIN_USERNAME)
     if len(password) < MIN_PASSWORD:
-        return False, f"A senha precisa ter ao menos {MIN_PASSWORD} caracteres."
+        return False, t("auth.password_too_short", n=MIN_PASSWORD)
     if role not in ("user", "admin"):
         role = "user"
     user_id = database.create_user(username, hash_password(password), role=role)
     if user_id is None:
-        return False, "Este nome de usuário já está em uso."
+        return False, t("auth.username_taken")
     log_event("user_created_admin", f"Usuário '{username}' criado pelo admin ({role})",
               user_id=user_id)
-    return True, f"Usuário '{username}' criado."
+    return True, t("auth.user_created", username=username)
 
 
 def admin_reset_password(user_id: int, nova: str) -> tuple[bool, str]:
     if len(nova) < MIN_PASSWORD:
-        return False, f"A nova senha precisa ter ao menos {MIN_PASSWORD} caracteres."
+        return False, t("auth.new_password_too_short", n=MIN_PASSWORD)
     database.set_password(user_id, hash_password(nova))
     log_event("password_reset_admin", f"Senha redefinida pelo admin (user {user_id})",
               user_id=user_id)
-    return True, "Senha redefinida."
+    return True, t("auth.password_reset")
 
 
 def admin_set_role(user_id: int, role: str) -> tuple[bool, str]:
     if role not in ("user", "admin"):
-        return False, "Perfil inválido."
+        return False, t("auth.invalid_role")
     # Impede remover o último admin do sistema.
     if role == "user":
         alvo = database.get_user_by_id(user_id)
         if alvo and alvo["role"] == "admin" and database.count_admins() <= 1:
-            return False, "Não é possível rebaixar o último administrador."
+            return False, t("auth.cannot_demote_last_admin")
     database.set_role(user_id, role)
     log_event("role_changed_admin", f"Perfil do usuário {user_id} alterado para {role}",
               user_id=user_id)
-    return True, "Perfil atualizado."
+    return True, t("auth.role_updated")
 
 
 def admin_delete_user(user_id: int) -> tuple[bool, str]:
     alvo = database.get_user_by_id(user_id)
     if alvo is None:
-        return False, "Usuário não encontrado."
+        return False, t("auth.user_not_found")
     if alvo["role"] == "admin" and database.count_admins() <= 1:
-        return False, "Não é possível excluir o último administrador."
+        return False, t("auth.cannot_delete_last_admin")
     database.delete_user(user_id)
     log_event("user_deleted_admin", f"Usuário '{alvo['username']}' excluído pelo admin",
               user_id=None)
-    return True, f"Usuário '{alvo['username']}' excluído (e suas análises)."
+    return True, t("auth.user_deleted", username=alvo["username"])

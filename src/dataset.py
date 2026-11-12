@@ -15,6 +15,8 @@ import json
 import os
 import zipfile
 
+from i18n import t
+
 
 def _linhas_yolo(labels, width, height, class_id=0):
     """Converte caixas [x, y, w, h] (px, canto sup-esq) em linhas YOLO normalizadas."""
@@ -81,11 +83,7 @@ def build_yolo_zip(candidatos, class_name="Abelha") -> bytes:
         zf.writestr("data.yaml", data_yaml)
         zf.writestr("classes.txt", f"{class_name}\n")
         zf.writestr("README.txt",
-                    "Dataset YOLO gerado pelo Bee Tracker.\n"
-                    f"Imagens: {n_imgs} | Caixas: {n_caixas} | "
-                    f"Negativas (sem abelha): {n_neg}\n\n"
-                    "Treino (exemplo, Ultralytics):\n"
-                    "  yolo detect train data=data.yaml model=yolov8n.pt epochs=100 imgsz=640\n")
+                    t("dataset.readme", n_imgs=n_imgs, n_boxes=n_caixas, n_neg=n_neg))
     return buf.getvalue()
 
 

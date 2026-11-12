@@ -1,5 +1,5 @@
 """
-Bee Tracker — Detecção e rastreamento de abelha com YOLOv4 (OpenCV DNN).
+BeeMove — detecção e rastreamento de abelhas em placas (Darknet/OpenCV DNN ou Ultralytics).
 
 Desempenho:
 - Pós-processamento (decodificação YOLO + NMS) em C++ via cv2.dnn_DetectionModel.
@@ -16,6 +16,7 @@ Persistência e usuários:
   app_logging.py.
 """
 
+import html
 import json
 import logging
 import os
@@ -25,6 +26,8 @@ import subprocess
 import tempfile
 import threading
 import time
+import zlib
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, time as dtime, timedelta as dtimedelta
 from pathlib import Path
@@ -46,6 +49,8 @@ import dataset
 import report
 import ui
 from app_logging import log_event
+import i18n
+from i18n import t
 
 # --- Configuração (sobrescrevível por variáveis de ambiente) ---
 # Por padrão os pesos ficam em <raiz do projeto>/models; o caminho é resolvido
@@ -65,7 +70,7 @@ _IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
 UI_UPDATE_EVERY = 10    # atualiza barra/status a cada N frames processados
 QUEUE_SIZE = 32         # profundidade da fila leitor -> inferência
 
-st.set_page_config(page_title="Bee Tracker — YOLOv4", page_icon="🐝",
+st.set_page_config(page_title=t("core.page_title"), page_icon="🐝",
                    layout="wide", initial_sidebar_state="expanded")
 
 
@@ -89,7 +94,7 @@ def cuda_disponivel() -> bool:
         return False
 
 
-@st.cache_resource(show_spinner="Carregando modelo YOLO...")
+@st.cache_resource(show_spinner=t("core.loading_model"))
 def carregar_classes():
     if not os.path.exists(YOLO_NAMES):
         return None
@@ -162,14 +167,50 @@ def modelo_ativo() -> tuple[str, str]:
     return cfg, weights
 
 
-@st.cache_resource(show_spinner="Carregando modelo YOLO...")
+class ErroCarga(str):
+    """Texto cru (sem tradução) de uma falha ao carregar o modelo + o seu tipo.
+
+    `tipo`: "cuda"  -> o backend CUDA falhou no warm-up e o modelo roda na CPU;
+            "model" -> o .pt (Ultralytics) não carregou e o Darknet padrão foi
+                       usado no lugar (pode estar na GPU).
+    Continua sendo um str (logs, `in`, RuntimeError); a tradução é feita só na
+    exibição, por texto_erro_carga().
+    """
+
+    def __new__(cls, detalhe: str, tipo: str):
+        obj = super().__new__(cls, detalhe)
+        obj.tipo = tipo
+        return obj
+
+
+def texto_erro_carga(erro) -> str:
+    """Mensagem de falha de carga pronta para a interface (no idioma atual)."""
+    if getattr(erro, "tipo", None) == "model":
+        return t("model.ultralytics_unavailable", error=str(erro))
+    return str(erro)
+
+
+# Token neutro (gravado em analyses.backend): o texto é traduzido na exibição.
+BACKEND_CPU_FALLBACK = "CPU (fallback)"
+
+
+def rotulo_backend(backend) -> str:
+    """Backend para exibição; o fallback (inclusive o texto antigo em português
+    gravado em análises anteriores) aparece traduzido."""
+    if backend and "fallback" in str(backend):
+        return t("model.backend_cpu_fallback")
+    return backend or "—"
+
+
+@st.cache_resource(show_spinner=t("core.loading_model"))
 def carregar_modelo(input_size: int, usar_gpu: bool, fp16: bool,
                     cfg_path: str = None, weights_path: str = None):
     """Carrega a rede Darknet (cfg/weights selecionáveis no admin).
 
     Retorna (DetectionModel, descrição do backend, erro_cuda) — erro_cuda é
-    None quando tudo deu certo, ou a mensagem da falha que causou o fallback
-    GPU -> CPU (ex.: imagem compilada para outra arquitetura de GPU).
+    None quando tudo deu certo, ou um ErroCarga com a falha que causou o
+    fallback: tipo "cuda" (GPU -> CPU, ex.: imagem compilada para outra
+    arquitetura de GPU) ou "model" (.pt -> Darknet padrão).
     `cfg_path`/`weights_path` entram na chave de cache, então trocar de modelo
     no admin recarrega automaticamente. Pesos `.pt` carregam via Ultralytics
     (caminho separado do Darknet/OpenCV); se o Ultralytics falhar, cai para o
@@ -189,9 +230,10 @@ def carregar_modelo(input_size: int, usar_gpu: bool, fp16: bool,
                       input_size=input_size)
             return _ModeloUltralytics(YOLO(wp), device, input_size), backend, None
         except Exception as e:
-            erro_cuda = ("Ultralytics indisponível: "
-                         + (str(e).strip().splitlines()[-1] if str(e) else repr(e)))
-            log_event("model_load_failed", erro_cuda, level=logging.ERROR)
+            erro_cuda = ErroCarga(
+                str(e).strip().splitlines()[-1] if str(e) else repr(e), "model")
+            log_event("model_load_failed", f"Ultralytics indisponível: {erro_cuda}",
+                      level=logging.ERROR)
             wp, cfg = YOLO_WEIGHTS, YOLO_CFG  # fallback p/ o Darknet padrão
 
     net = cv2.dnn.readNetFromDarknet(cfg, wp)
@@ -218,10 +260,11 @@ def carregar_modelo(input_size: int, usar_gpu: bool, fp16: bool,
     except Exception as e:
         # ex.: "(-216:No CUDA support) ... check CUDA_ARCH_PTX or CUDA_ARCH_BIN"
         # quando o OpenCV foi compilado para outra compute capability
-        erro_cuda = str(e).strip().splitlines()[-1] if str(e) else repr(e)
+        erro_cuda = ErroCarga(
+            str(e).strip().splitlines()[-1] if str(e) else repr(e), "cuda")
         net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
         net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-        backend = "CPU (fallback — backend CUDA falhou)"
+        backend = BACKEND_CPU_FALLBACK
         log_event("cuda_fallback", f"Backend CUDA falhou no warm-up: {erro_cuda}",
                   level=logging.WARNING)
         model.detect(dummy, 0.5, 0.4)
@@ -259,13 +302,44 @@ class LeitorDeFrames(threading.Thread):
             self.fim_frame = self.inicio_frame
         self.total_frames = max(1, self.fim_frame - self.inicio_frame + 1)
         self.aberto = self.cap.isOpened()
+        # Pedido de parada (ex.: a execução do Streamlit foi interrompida no
+        # meio): a thread para de decodificar e libera o VideoCapture.
+        self._parar = threading.Event()
+
+    def _por_na_fila(self, item) -> bool:
+        """put() que desiste se a parada for pedida (fila cheia sem consumidor)."""
+        while not self._parar.is_set():
+            try:
+                self.fila.put(item, timeout=0.2)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def parar(self):
+        """Interrompe a leitura e esvazia a fila (libera a memória dos frames)."""
+        self._parar.set()
+
+        def _esvaziar():
+            try:
+                while True:
+                    self.fila.get_nowait()
+            except queue.Empty:
+                pass
+
+        _esvaziar()
+        if self.is_alive():
+            self.join(timeout=2.0)
+        _esvaziar()   # um put() em curso pode ter entrado após o 1º esvaziamento
+        if not self.is_alive():
+            self.cap.release()   # já liberado no run(); idempotente
 
     def run(self):
         if self.inicio_frame > 0:
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.inicio_frame)
         indice = self.inicio_frame
         try:
-            while indice <= self.fim_frame:
+            while indice <= self.fim_frame and not self._parar.is_set():
                 if (indice - self.inicio_frame) % self.frame_skip != 0:
                     if not self.cap.grab():
                         break
@@ -274,10 +348,11 @@ class LeitorDeFrames(threading.Thread):
                 ok, frame = self.cap.read()
                 if not ok:
                     break
-                self.fila.put((indice, frame))
+                if not self._por_na_fila((indice, frame)):
+                    break
                 indice += 1
         finally:
-            self.fila.put(None)  # sentinela de fim
+            self._por_na_fila(None)  # sentinela de fim
             self.cap.release()
 
 
@@ -345,20 +420,24 @@ class RastreadorMultiplo:
 def processar_video(video_path, model, class_names, frame_skip, conf, nms,
                     num_alvos=1, zones=None, ampliar_areas=False, gerar_video=False,
                     inicio_s=0.0, fim_s=None, coletar_candidatos=False,
-                    conf_captura=0.15, limiar_revisao=0.5, max_candidatos=200):
+                    conf_captura=0.15, limiar_revisao=0.5, max_candidatos=200,
+                    fase=None):
+    """`fase`: callback opcional fase(texto) para anunciar as etapas na interface
+    (ex.: dentro de um st.status). Não altera o processamento."""
+    fase = fase or (lambda _msg: None)
     leitor = LeitorDeFrames(video_path, frame_skip, inicio_s, fim_s)
     if not leitor.aberto:
-        st.error("Erro ao abrir o arquivo de vídeo.")
+        leitor.cap.release()
+        st.error(t("core.video_open_error"))
         return None
+    fase(t("analysis.phase_reading", total=leitor.total_frames, skip=max(1, frame_skip),
+           n=-(-leitor.total_frames // max(1, frame_skip))))
 
     id_alvo = -1
     if class_names and TARGET_CLASS in class_names:
         id_alvo = class_names.index(TARGET_CLASS)
     elif class_names:
-        st.warning(
-            f"Classe '{TARGET_CLASS}' não encontrada em '{YOLO_NAMES}'. "
-            "Usando a detecção de maior confiança de qualquer classe."
-        )
+        st.warning(t("core.class_not_found", cls=TARGET_CLASS, names=YOLO_NAMES))
 
     # Quando há áreas definidas, cada área é uma placa/abelha: a detecção é
     # atribuída à área que a contém e detecções fora de todas as áreas são
@@ -374,7 +453,7 @@ def processar_video(video_path, model, class_names, frame_skip, conf, nms,
             pts = z.get("points") or []
             if len(pts) >= 3:
                 zone_polys.append(np.asarray(pts, float).reshape(-1, 2))
-                zone_names.append(z.get("name") or f"Área {len(zone_names) + 1}")
+                zone_names.append(z.get("name") or t("core.zone_default", n=len(zone_names) + 1))
         if zone_polys:
             zone_paths = [_MplPath(p) for p in zone_polys]
             num_alvos = len(zone_paths)
@@ -382,172 +461,188 @@ def processar_video(video_path, model, class_names, frame_skip, conf, nms,
             zone_polys = None
 
     total = max(leitor.total_frames, 1)
+    fase(t("analysis.phase_detecting", n=num_alvos))
     barra = st.progress(0)
     status = st.empty()
-    leitor.start()
-
-    centroides, indices_frames, track_ids = [], [], []
-    rastreador = RastreadorMultiplo(num_alvos)
-    primeiro_frame = None
-    processados = 0
     gravador = None
-    # Coleta de candidatos para reanotação: amostra frames espaçados e roda um
-    # passe de baixa confiança; guarda os fracos/sem-detecção (capado).
-    candidatos = []
-    proc_estimado = max(1, leitor.total_frames // max(1, frame_skip))
-    # Amostra ~60 frames espaçados p/ avaliar candidatos (cada frame pode render
-    # vários, um por área); o total fica limitado por max_candidatos.
-    passo_cap = max(1, proc_estimado // 60)
-    inicio = time.perf_counter()
+    leitor.start()
+    concluido = False
+    try:
 
-    while True:
-        item = leitor.fila.get()
-        if item is None:
-            break
-        indice, frame = item
-        if primeiro_frame is None:
-            primeiro_frame = frame.copy()
+        centroides, indices_frames, track_ids = [], [], []
+        rastreador = RastreadorMultiplo(num_alvos)
+        primeiro_frame = None
+        processados = 0
+        # Coleta de candidatos para reanotação: amostra frames espaçados e roda um
+        # passe de baixa confiança; guarda os fracos/sem-detecção (capado).
+        candidatos = []
+        proc_estimado = max(1, leitor.total_frames // max(1, frame_skip))
+        # Amostra ~60 frames espaçados p/ avaliar candidatos (cada frame pode render
+        # vários, um por área); o total fica limitado por max_candidatos.
+        passo_cap = max(1, proc_estimado // 60)
+        inicio = time.perf_counter()
 
-        # Coletado só quando há vídeo de conferência: detecções brutas do YOLO e
-        # as aceitas/rastreadas, para desenhar no frame.
-        raw_boxes, aceitos = [], []
-        # Confiança da detecção ACEITA em cada área neste frame (para decidir
-        # candidatos: área sem detecção / detecção fraca vira candidata).
-        score_area_frame = {}
+        while True:
+            item = leitor.fila.get()
+            if item is None:
+                break
+            indice, frame = item
+            if primeiro_frame is None:
+                primeiro_frame = frame.copy()
 
-        if zone_paths is not None and ampliar_areas:
-            # Detecção ampliada: recorta cada área e detecta ali (a abelha ocupa
-            # muito mais pixels). Uma abelha por área; track_id = índice da área.
-            for zi, (poly, path) in enumerate(zip(zone_polys, zone_paths)):
-                outras = [p for j, p in enumerate(zone_paths) if j != zi]
-                res = _detectar_em_recorte(frame, model, conf, nms, id_alvo,
-                                           poly, path, outras_paths=outras)
-                if res is not None:
-                    cx, cy, box, score = res
-                    centroides.append((cx, cy))
-                    track_ids.append(zi)
-                    indices_frames.append(indice)
-                    score_area_frame[zi] = score
-                    if gerar_video:
-                        aceitos.append((cx, cy, zone_names[zi]))
-                        raw_boxes.append((*box, conf))
-        else:
-            classes, scores, boxes = model.detect(frame, conf, nms)
+            # Coletado só quando há vídeo de conferência: detecções brutas do YOLO e
+            # as aceitas/rastreadas, para desenhar no frame.
+            raw_boxes, aceitos = [], []
+            # Confiança da detecção ACEITA em cada área neste frame (para decidir
+            # candidatos: área sem detecção / detecção fraca vira candidata).
+            score_area_frame = {}
 
-            # todas as detecções da classe alvo: (confiança, cx, cy)
-            dets = []
-            if len(scores) > 0:
-                scores = np.asarray(scores).reshape(-1)
-                classes = np.asarray(classes).reshape(-1)
-                boxes = np.asarray(boxes).reshape(-1, 4)
-                if id_alvo >= 0:
-                    mascara = classes == id_alvo
-                    scores, boxes = scores[mascara], boxes[mascara]
-                for s, (x, y, w, h) in zip(scores, boxes):
-                    dets.append((float(s), float(x + w / 2.0), float(y + h / 2.0)))
-                    if gerar_video:
-                        raw_boxes.append((float(x), float(y), float(w), float(h), float(s)))
-
-            if zone_paths is not None:
-                # uma abelha por área: melhor detecção dentro de cada área
-                melhor = {}  # índice da área -> (confiança, cx, cy)
-                for s, cx, cy in dets:
-                    for zi, path in enumerate(zone_paths):
-                        if path.contains_point((cx, cy)):
-                            if zi not in melhor or s > melhor[zi][0]:
-                                melhor[zi] = (s, cx, cy)
-                            break  # áreas não se sobrepõem: para na primeira
-                for zi, (s, cx, cy) in melhor.items():
-                    centroides.append((cx, cy))
-                    track_ids.append(zi)
-                    indices_frames.append(indice)
-                    score_area_frame[zi] = s
-                    if gerar_video:
-                        aceitos.append((cx, cy, zone_names[zi]))
-            else:
-                dets.sort(key=lambda d: d[0], reverse=True)
-                pontos = [(cx, cy) for _, cx, cy in dets[:num_alvos]]
-                for tid, (cx, cy) in rastreador.atualizar(pontos):
-                    centroides.append((cx, cy))
-                    track_ids.append(tid)
-                    indices_frames.append(indice)
-                    if gerar_video:
-                        aceitos.append((cx, cy, f"Abelha {tid + 1}"))
-
-        # Candidatos para reanotação (frame/recorte LIMPO, antes de desenhar):
-        # passe de baixa confiança; guarda os fracos/ausentes. Com áreas, gera
-        # UM candidato por área (recorte) — imagem menor, abelha maior.
-        def _guardar_candidato(img_bgr, melhor_s, sugeridas, area=None):
-            ok_jpg, jpg = cv2.imencode(".jpg", img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 88])
-            if not ok_jpg:
-                return
-            h0, w0 = img_bgr.shape[:2]
-            candidatos.append({
-                "frame_index": int(indice),
-                "reason": "sem_deteccao" if melhor_s == 0 else "baixa_confianca",
-                "pred_conf": melhor_s, "pred_boxes": sugeridas,
-                "width": int(w0), "height": int(h0),
-                "image_jpg": jpg.tobytes(), "area": area,
-            })
-
-        if (coletar_candidatos and len(candidatos) < max_candidatos
-                and processados % passo_cap == 0):
-            if zone_paths is not None:
-                # Um candidato por área cuja detecção ACEITA (na análise) ficou
-                # ausente ou fraca — POR ÁREA, não pelo frame todo. O recorte só
-                # serve para a imagem e as caixas sugeridas (pré-preenchimento).
+            if zone_paths is not None and ampliar_areas:
+                # Detecção ampliada: recorta cada área e detecta ali (a abelha ocupa
+                # muito mais pixels). Uma abelha por área; track_id = índice da área.
                 for zi, (poly, path) in enumerate(zip(zone_polys, zone_paths)):
-                    if len(candidatos) >= max_candidatos:
-                        break
-                    sc = score_area_frame.get(zi, 0.0)
-                    if sc >= limiar_revisao:
-                        continue  # área bem detectada nesta amostra → não é candidata
                     outras = [p for j, p in enumerate(zone_paths) if j != zi]
-                    rc = _recorte_candidato(frame, model, conf_captura, nms,
-                                            id_alvo, poly, path, outras)
-                    if rc is None:
-                        continue
-                    recorte, _conf_lowpass, sugeridas = rc
-                    _guardar_candidato(recorte, sc, sugeridas, zone_names[zi])
+                    res = _detectar_em_recorte(frame, model, conf, nms, id_alvo,
+                                               poly, path, outras_paths=outras)
+                    if res is not None:
+                        cx, cy, box, score = res
+                        centroides.append((cx, cy))
+                        track_ids.append(zi)
+                        indices_frames.append(indice)
+                        score_area_frame[zi] = score
+                        if gerar_video:
+                            aceitos.append((cx, cy, zone_names[zi]))
+                            raw_boxes.append((*box, conf))
             else:
-                # sem áreas: candidato do frame inteiro
-                cc, sc_c, bx_c = model.detect(frame, conf_captura, nms)
-                sugeridas, melhor_s = [], 0.0
-                if len(sc_c) > 0:
-                    sc_c = np.asarray(sc_c).reshape(-1)
-                    cc = np.asarray(cc).reshape(-1)
-                    bx_c = np.asarray(bx_c).reshape(-1, 4)
+                classes, scores, boxes = model.detect(frame, conf, nms)
+
+                # todas as detecções da classe alvo: (confiança, cx, cy)
+                dets = []
+                if len(scores) > 0:
+                    scores = np.asarray(scores).reshape(-1)
+                    classes = np.asarray(classes).reshape(-1)
+                    boxes = np.asarray(boxes).reshape(-1, 4)
                     if id_alvo >= 0:
-                        mc = cc == id_alvo
-                        sc_c, bx_c = sc_c[mc], bx_c[mc]
-                    for s, (x, y, w, h) in zip(sc_c, bx_c):
-                        sugeridas.append([float(x), float(y), float(w), float(h), float(s)])
-                    melhor_s = float(np.max(sc_c)) if len(sc_c) else 0.0
-                if melhor_s < limiar_revisao:
-                    _guardar_candidato(frame, melhor_s, sugeridas, None)
+                        mascara = classes == id_alvo
+                        scores, boxes = scores[mascara], boxes[mascara]
+                    for s, (x, y, w, h) in zip(scores, boxes):
+                        dets.append((float(s), float(x + w / 2.0), float(y + h / 2.0)))
+                        if gerar_video:
+                            raw_boxes.append((float(x), float(y), float(w), float(h), float(s)))
 
-        if gerar_video:
-            if gravador is None:
-                h0, w0 = frame.shape[:2]
-                fps_saida = (leitor.fps or 10.0) / max(frame_skip, 1)
-                gravador = _GravadorAnotado(w0, h0, fps_saida)
-            _desenhar_anotacoes(frame, zone_polys, raw_boxes, aceitos)
-            gravador.escrever(frame)
+                if zone_paths is not None:
+                    # uma abelha por área: melhor detecção dentro de cada área
+                    melhor = {}  # índice da área -> (confiança, cx, cy)
+                    for s, cx, cy in dets:
+                        for zi, path in enumerate(zone_paths):
+                            if path.contains_point((cx, cy)):
+                                if zi not in melhor or s > melhor[zi][0]:
+                                    melhor[zi] = (s, cx, cy)
+                                break  # áreas não se sobrepõem: para na primeira
+                    for zi, (s, cx, cy) in melhor.items():
+                        centroides.append((cx, cy))
+                        track_ids.append(zi)
+                        indices_frames.append(indice)
+                        score_area_frame[zi] = s
+                        if gerar_video:
+                            aceitos.append((cx, cy, zone_names[zi]))
+                else:
+                    dets.sort(key=lambda d: d[0], reverse=True)
+                    pontos = [(cx, cy) for _, cx, cy in dets[:num_alvos]]
+                    for tid, (cx, cy) in rastreador.atualizar(pontos):
+                        centroides.append((cx, cy))
+                        track_ids.append(tid)
+                        indices_frames.append(indice)
+                        if gerar_video:
+                            aceitos.append((cx, cy, t("core.bee_label", n=tid + 1)))
 
-        processados += 1
-        if processados % UI_UPDATE_EVERY == 0:
-            rel = indice - leitor.inicio_frame + 1  # progresso dentro do trecho
-            barra.progress(min(rel, total) / total)
-            fps_proc = processados / max(time.perf_counter() - inicio, 1e-6)
-            status.text(
-                f"Frame {rel}/{total} — "
-                f"{fps_proc:.1f} frames/s ({len(centroides)} detecções)"
-            )
+            # Candidatos para reanotação (frame/recorte LIMPO, antes de desenhar):
+            # passe de baixa confiança; guarda os fracos/ausentes. Com áreas, gera
+            # UM candidato por área (recorte) — imagem menor, abelha maior.
+            def _guardar_candidato(img_bgr, melhor_s, sugeridas, area=None):
+                ok_jpg, jpg = cv2.imencode(".jpg", img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 88])
+                if not ok_jpg:
+                    return
+                h0, w0 = img_bgr.shape[:2]
+                candidatos.append({
+                    "frame_index": int(indice),
+                    "reason": "sem_deteccao" if melhor_s == 0 else "baixa_confianca",
+                    "pred_conf": melhor_s, "pred_boxes": sugeridas,
+                    "width": int(w0), "height": int(h0),
+                    "image_jpg": jpg.tobytes(), "area": area,
+                })
 
-    tempo = time.perf_counter() - inicio
-    barra.empty()
-    status.empty()
-    video_conf = gravador.finalizar() if gravador is not None else None
+            if (coletar_candidatos and len(candidatos) < max_candidatos
+                    and processados % passo_cap == 0):
+                if zone_paths is not None:
+                    # Um candidato por área cuja detecção ACEITA (na análise) ficou
+                    # ausente ou fraca — POR ÁREA, não pelo frame todo. O recorte só
+                    # serve para a imagem e as caixas sugeridas (pré-preenchimento).
+                    for zi, (poly, path) in enumerate(zip(zone_polys, zone_paths)):
+                        if len(candidatos) >= max_candidatos:
+                            break
+                        sc = score_area_frame.get(zi, 0.0)
+                        if sc >= limiar_revisao:
+                            continue  # área bem detectada nesta amostra → não é candidata
+                        outras = [p for j, p in enumerate(zone_paths) if j != zi]
+                        rc = _recorte_candidato(frame, model, conf_captura, nms,
+                                                id_alvo, poly, path, outras)
+                        if rc is None:
+                            continue
+                        recorte, _conf_lowpass, sugeridas = rc
+                        _guardar_candidato(recorte, sc, sugeridas, zone_names[zi])
+                else:
+                    # sem áreas: candidato do frame inteiro
+                    cc, sc_c, bx_c = model.detect(frame, conf_captura, nms)
+                    sugeridas, melhor_s = [], 0.0
+                    if len(sc_c) > 0:
+                        sc_c = np.asarray(sc_c).reshape(-1)
+                        cc = np.asarray(cc).reshape(-1)
+                        bx_c = np.asarray(bx_c).reshape(-1, 4)
+                        if id_alvo >= 0:
+                            mc = cc == id_alvo
+                            sc_c, bx_c = sc_c[mc], bx_c[mc]
+                        for s, (x, y, w, h) in zip(sc_c, bx_c):
+                            sugeridas.append([float(x), float(y), float(w), float(h), float(s)])
+                        melhor_s = float(np.max(sc_c)) if len(sc_c) else 0.0
+                    if melhor_s < limiar_revisao:
+                        _guardar_candidato(frame, melhor_s, sugeridas, None)
+
+            if gerar_video:
+                if gravador is None:
+                    h0, w0 = frame.shape[:2]
+                    fps_saida = (leitor.fps or 10.0) / max(frame_skip, 1)
+                    gravador = _GravadorAnotado(w0, h0, fps_saida)
+                _desenhar_anotacoes(frame, zone_polys, raw_boxes, aceitos)
+                gravador.escrever(frame)
+
+            processados += 1
+            if processados % UI_UPDATE_EVERY == 0:
+                rel = indice - leitor.inicio_frame + 1  # progresso dentro do trecho
+                barra.progress(min(rel, total) / total)
+                decorrido = max(time.perf_counter() - inicio, 1e-6)
+                fps_proc = processados / decorrido
+                # Tempo restante: ritmo de avanço no trecho (frames do vídeo/s).
+                restante = max(0, total - rel) * decorrido / max(rel, 1)
+                status.text(t("core.progress_status", rel=rel, total=total,
+                              fps=fps_proc, n=len(centroides),
+                              eta=_fmt_duracao(restante)))
+
+        tempo = time.perf_counter() - inicio
+        barra.empty()
+        status.empty()
+        if gravador is not None:
+            fase(t("analysis.phase_video"))
+        video_conf = gravador.finalizar() if gravador is not None else None
+        concluido = True
+    finally:
+        if not concluido:
+            # Interrompido no meio (erro, ou a execução foi trocada/parada pelo
+            # Streamlit — RerunException/StopException não são Exception):
+            # para a thread de leitura e apaga o vídeo de conferência parcial.
+            leitor.parar()
+            if gravador is not None:
+                gravador.descartar()
 
     return Resultado(
         centroides=np.asarray(centroides, dtype=float).reshape(-1, 2),
@@ -584,12 +679,12 @@ def velocidade_media_px_s(centroides, indices_frames, fps_video) -> float | None
 
 # --- Painel de análises (compartilhado por análises novas e salvas) ---
 
-def _mostrar(fig, vazio="Sem dados suficientes para este gráfico."):
+def _mostrar(fig, vazio=None):
     if fig is not None:
         st.pyplot(fig)
         plt.close(fig)
     else:
-        st.info(vazio)
+        st.info(vazio or t("results.no_data_chart"))
 
 
 def _recorte_area(fundo, centroides, zona, margem=0.12):
@@ -622,31 +717,51 @@ def render_zonas(centroides, indices, fundo, fps_video, zones,
         centroides, indices, fps_video, zones, frame_skip, pixels_per_mm
     )
     if not metr_z:
-        st.info("Nenhuma área definida para esta análise.")
+        st.info(t("results.no_zones"))
         return
 
+    # Números crus no DataFrame (a ordenação funciona) e formatação/unidade no
+    # cabeçalho via column_config. Uma unidade por coluna: mm com escala, senão px.
+    tem_mm = all("distancia_dentro_mm" in m for m in metr_z)
     linhas = []
     for m in metr_z:
-        tem_mm = "distancia_dentro_mm" in m
         linha = {
-            "Área": m["nome"],
-            "Detecções": m["deteccoes_dentro"],
-            "% das detecções": f"{m['perc_deteccoes']:.1f}%",
-            "Visitas": m["visitas"],
+            "area": m["nome"],
+            "detections": m["deteccoes_dentro"],
+            "pct": m["perc_deteccoes"],
+            "visits": m["visitas"],
+            "residence": m.get("tempo_permanencia"),
         }
-        if "tempo_permanencia" in m:
-            linha["Permanência (s)"] = f"{m['tempo_permanencia']:.1f}"
-        # Com escala, só mm; sem escala, px.
         if tem_mm:
-            linha["Dist. dentro (mm)"] = f"{m['distancia_dentro_mm']:.1f}"
-            if "area_mm2" in m:
-                linha["Área (mm²)"] = f"{m['area_mm2']:.0f}"
+            linha["dist"] = m["distancia_dentro_mm"]
+            linha["area_mm2"] = m.get("area_mm2")
         else:
-            linha["Dist. dentro (px)"] = f"{m['distancia_dentro_px']:.0f}"
+            linha["dist"] = m["distancia_dentro_px"]
         linhas.append(linha)
-    st.dataframe(pd.DataFrame(linhas), hide_index=True, width="stretch")
-    st.caption("Permanência = fração do tempo rastreado em que a abelha esteve "
-               "dentro da área. Visitas = nº de entradas na área.")
+    df = pd.DataFrame(linhas)
+    if df["residence"].isna().all():
+        df = df.drop(columns="residence")
+    if "area_mm2" in df and df["area_mm2"].isna().all():
+        df = df.drop(columns="area_mm2")
+    unid = "mm" if tem_mm else "px"
+    cfg = {
+        "area": st.column_config.TextColumn(t("results.col_area")),
+        "detections": st.column_config.NumberColumn(t("results.col_detections"),
+                                                    format="%d"),
+        "pct": st.column_config.ProgressColumn(t("results.col_pct_detections"),
+                                               min_value=0, max_value=100,
+                                               format="%.1f%%"),
+        "visits": st.column_config.NumberColumn(t("results.col_visits"), format="%d"),
+        "residence": st.column_config.NumberColumn(t("results.col_residence_s"),
+                                                   format="%.1f"),
+        "dist": st.column_config.NumberColumn(t("results.col_dist_inside", unit=unid),
+                                              format="%.1f" if tem_mm else "%.0f"),
+        "area_mm2": st.column_config.NumberColumn(t("results.col_area_mm2"),
+                                                  format="%.0f"),
+    }
+    st.dataframe(df, hide_index=True, width="stretch",
+                 column_config={k: v for k, v in cfg.items() if k in df.columns})
+    st.caption(t("results.zones_caption"))
 
     col1, col2 = st.columns(2)
     with col1:
@@ -655,10 +770,49 @@ def render_zonas(centroides, indices, fundo, fps_video, zones,
         _mostrar(analytics.plot_permanencia_zonas(metr_z))
 
 
+def _limiar_parada_txt(limiar_parada_px, pixels_per_mm=None, fps_video=None,
+                       frame_skip=None):
+    """Legenda do limiar de parada em uso (px, e mm / mm/s quando há escala).
+
+    O único controle é o slider da barra lateral; aqui só mostramos o valor e
+    onde alterá-lo (evita dois widgets disputando o mesmo valor).
+    """
+    equiv = ""
+    if pixels_per_mm and pixels_per_mm > 0:
+        mm = limiar_parada_px / pixels_per_mm
+        if fps_video and fps_video > 0 and frame_skip:
+            equiv = t("results.stop_threshold_equiv_speed", mm=mm,
+                      mms=mm / (frame_skip / fps_video))
+        else:
+            equiv = t("results.stop_threshold_equiv", mm=mm)
+    return t("results.stop_threshold_in_use", px=limiar_parada_px, equiv=equiv,
+             where=f"{t('sidebar.settings')} → {t('sidebar.tracking_areas')}",
+             label=t("sidebar.stop_threshold"))
+
+
+# Gráficos opcionais: valor interno -> chave booleana em session_state
+# (os rótulos traduzidos só aparecem via format_func).
+_GRAF_OPCIONAIS = {"position": "graf_posicao", "speed": "graf_velocidade",
+                   "hist": "graf_histograma"}
+
+
+def _pills_graficos(opcoes, key):
+    """Pills (multi) dos gráficos opcionais; mantém graf_* em session_state."""
+    rotulos = {"position": t("results.opt_position"), "speed": t("results.opt_speed"),
+               "hist": t("results.opt_speed_hist")}
+    padrao = [o for o in opcoes if st.session_state.get(_GRAF_OPCIONAIS[o], True)]
+    escolha = st.pills(t("results.optional_charts"), opcoes, selection_mode="multi",
+                       default=padrao, format_func=lambda o: rotulos[o], key=key)
+    escolha = list(escolha or [])
+    for o in opcoes:
+        st.session_state[_GRAF_OPCIONAIS[o]] = o in escolha
+    return set(escolha)
+
+
 def render_analytics(centroides, indices, fundo, fps_video, limiar_parada_px,
                      frames_processados=None, frame_skip=None, pixels_per_mm=None,
-                     zones=None, area_ref_px2=None):
-    """Cartões de métricas + abas de gráficos a partir dos dados brutos.
+                     zones=None, area_ref_px2=None, key_prefix=""):
+    """Cartões de métricas + grupos de gráficos a partir dos dados brutos.
 
     `area_ref_px2`: área de referência (px²) para a cobertura da área explorada.
     Quando informada (ex.: área da zona/placa), a cobertura é relativa a ela
@@ -679,84 +833,89 @@ def render_analytics(centroides, indices, fundo, fps_video, limiar_parada_px,
     # Cobertura: relativa à área delimitada (se informada) ou ao quadro.
     if area_ref_px2 and area_ref_px2 > 0:
         pct = 100.0 * metr.get("area_explorada_px2", 0.0) / area_ref_px2
-        cobertura_txt = f"{pct:.1f}% da área"
+        cobertura_txt = t("results.coverage_of_area", pct=pct)
     elif metr.get("cobertura_perc") is not None:
-        cobertura_txt = f"{metr['cobertura_perc']:.1f}% do quadro"
+        cobertura_txt = t("results.coverage_of_frame", pct=metr['cobertura_perc'])
     else:
         cobertura_txt = None
-    with st.expander("📊 Métricas resumidas", expanded=True):
+    with st.expander(t("results.summary_metrics"), expanded=True):
         if tem_mm:
-            st.caption(f"Escala calibrada: **{metr['pixels_per_mm']:.2f} px/mm** — "
-                       "métricas em milímetros.")
+            st.caption(t("results.calibrated_scale", ppm=metr['pixels_per_mm']))
         a, b, c, d = st.columns(4)
-        a.metric("Detecções", metr["deteccoes"])
+        a.metric(t("results.detections"), metr["deteccoes"])
         if tem_mm:
-            b.metric("Distância total", f"{metr['distancia_mm']:.1f} mm")
-            c.metric("Deslocamento líquido", f"{metr['deslocamento_liquido_mm']:.1f} mm")
+            b.metric(t("results.total_distance"), f"{metr['distancia_mm']:.1f} mm")
+            c.metric(t("results.net_displacement"), f"{metr['deslocamento_liquido_mm']:.1f} mm")
         else:
-            b.metric("Distância total", f"{metr.get('distancia_px', 0):.0f} px")
-            c.metric("Deslocamento líquido",
+            b.metric(t("results.total_distance"), f"{metr.get('distancia_px', 0):.0f} px")
+            c.metric(t("results.net_displacement"),
                      f"{metr.get('deslocamento_liquido_px', 0):.0f} px")
-        d.metric("Retilineidade", f"{metr.get('retilineidade', 0):.2f}",
-                 help="Deslocamento líquido ÷ distância percorrida. "
-                      "1 = linha reta; perto de 0 = trajeto muito sinuoso.")
+        d.metric(t("results.straightness"), f"{metr.get('retilineidade', 0):.2f}",
+                 help=t("results.straightness_help"))
         e, f, g, h = st.columns(4)
         if tem_mm and tem_vel_mm:
-            e.metric("Velocidade média", f"{metr['velocidade_media_mm_s']:.2f} mm/s")
-            f.metric("Velocidade máxima", f"{metr['velocidade_max_mm_s']:.2f} mm/s")
+            e.metric(t("results.mean_speed"), f"{metr['velocidade_media_mm_s']:.2f} mm/s")
+            f.metric(t("results.max_speed"), f"{metr['velocidade_max_mm_s']:.2f} mm/s")
         else:
-            e.metric("Velocidade média", f"{metr.get('velocidade_media', 0):.1f} {uv}")
-            f.metric("Velocidade máxima", f"{metr.get('velocidade_max', 0):.1f} {uv}")
-        g.metric("Tempo em movimento", f"{metr.get('perc_movimento', 0):.0f}%",
-                 help=f"Fração do tempo com deslocamento ≥ {limiar_parada_px:.0f} px "
-                      "entre amostras.")
+            e.metric(t("results.mean_speed"), f"{metr.get('velocidade_media', 0):.1f} {uv}")
+            f.metric(t("results.max_speed"), f"{metr.get('velocidade_max', 0):.1f} {uv}")
+        g.metric(t("results.time_moving"), f"{metr.get('perc_movimento', 0):.0f}%",
+                 help=t("results.time_moving_help", thr=limiar_parada_px))
         if tem_mm:
-            h.metric("Área explorada", f"{metr['area_explorada_mm2']:.1f} mm²",
+            h.metric(t("results.explored_area"), f"{metr['area_explorada_mm2']:.1f} mm²",
                      delta=cobertura_txt, delta_color="off")
         else:
-            h.metric("Área explorada", f"{metr.get('area_explorada_px2', 0):.0f} px²",
+            h.metric(t("results.explored_area"), f"{metr.get('area_explorada_px2', 0):.0f} px²",
                      delta=cobertura_txt, delta_color="off")
 
         # Detalhamento de tempo (detectado/não detectado, caminhando/parado)
         if "tempo_detectado" in metr:
-            st.markdown("**Detalhamento do tempo**")
+            st.markdown(t("results.time_breakdown"))
             t1, t2, t3, t4 = st.columns(4)
-            t1.metric("Tempo detectado", f"{metr['tempo_detectado']:.1f} {ut}",
-                      delta=f"{metr.get('perc_detectado', 0):.0f}% dos frames",
+            t1.metric(t("results.time_detected"), f"{metr['tempo_detectado']:.1f} {ut}",
+                      delta=t("results.pct_of_frames", pct=metr.get('perc_detectado', 0)),
                       delta_color="off")
-            t2.metric("Tempo não detectado", f"{metr['tempo_nao_detectado']:.1f} {ut}",
-                      help="Frames processados em que a abelha não foi detectada.")
-            t3.metric("Tempo caminhando", f"{metr.get('tempo_movimento', 0):.1f} {ut}")
-            t4.metric("Tempo parado", f"{metr.get('tempo_parado', 0):.1f} {ut}")
+            t2.metric(t("results.time_not_detected"), f"{metr['tempo_nao_detectado']:.1f} {ut}",
+                      help=t("results.time_not_detected_help"))
+            t3.metric(t("results.time_walking"), f"{metr.get('tempo_movimento', 0):.1f} {ut}")
+            t4.metric(t("results.time_stopped"), f"{metr.get('tempo_parado', 0):.1f} {ut}")
+        # Limiar de parada em uso: as métricas de tempo em movimento dependem dele.
+        st.caption(_limiar_parada_txt(limiar_parada_px, pixels_per_mm, fps_video,
+                                      frame_skip))
 
     if fundo is None:
-        st.info("Sem o frame de fundo não é possível desenhar os gráficos espaciais.")
+        st.info(t("results.no_background"))
         return
 
-    with st.expander("📈 Gráficos", expanded=True):
-        tem_zonas = bool(zones)
-        nomes_abas = ["🗺️ Trajetória", "📈 Velocidade & Tempo", "🌡️ Cobertura espacial"]
-        if tem_zonas:
-            nomes_abas.append("🎯 Áreas")
-        abas = st.tabs(nomes_abas)
+    with st.expander(t("results.charts"), expanded=True):
+        # Só o grupo escolhido é calculado (st.tabs desenharia todos).
+        grupos = ["trajectory", "speed", "coverage"] + (["zones"] if zones else [])
+        rotulos_grupo = {"trajectory": t("results.tab_trajectory"),
+                         "speed": t("results.tab_speed_time"),
+                         "coverage": t("results.tab_coverage"),
+                         "zones": t("results.tab_zones")}
+        grupo = st.segmented_control(
+            t("results.chart_group"), grupos, default="trajectory", required=True,
+            format_func=lambda g: rotulos_grupo[g], key=f"{key_prefix}graf_grupo",
+            label_visibility="collapsed",
+        )
+        if grupo not in grupos:
+            grupo = "trajectory"
 
-        # Gráficos opcionais (configuráveis no menu lateral "📈 Gráficos exibidos")
-        ver_posicao = st.session_state.get("graf_posicao", True)
-        ver_velocidade = st.session_state.get("graf_velocidade", True)
-        ver_histograma = st.session_state.get("graf_histograma", True)
-
-        with abas[0]:
+        if grupo == "trajectory":
+            extras = _pills_graficos(["position"], f"{key_prefix}graf_extra_traj")
             _mostrar(analytics.plot_trajetoria_tempo(centroides, indices, fundo,
                                                      fps_video, zones=zones),
-                     "A trajetória precisa de ao menos 2 detecções.")
-            if ver_posicao:
-                st.markdown("**Posição X / Y ao longo do tempo**")
+                     t("results.trajectory_needs_2"))
+            if "position" in extras:
+                st.markdown(t("results.position_xy_time"))
                 _mostrar(analytics.plot_posicao_tempo(centroides, indices, fps_video))
 
-        with abas[1]:
-            if ver_velocidade:
+        elif grupo == "speed":
+            extras = _pills_graficos(["speed", "hist"], f"{key_prefix}graf_extra_vel")
+            if "speed" in extras:
                 _mostrar(analytics.plot_velocidade_tempo(centroides, indices, fps_video))
-            if ver_histograma:
+            if "hist" in extras:
                 col1, col2 = st.columns(2)
                 with col1:
                     _mostrar(analytics.plot_distancia_acumulada(centroides, indices, fps_video))
@@ -765,20 +924,108 @@ def render_analytics(centroides, indices, fundo, fps_video, limiar_parada_px,
             else:
                 _mostrar(analytics.plot_distancia_acumulada(centroides, indices, fps_video))
 
-        with abas[2]:
+        elif grupo == "coverage":
             col1, col2 = st.columns(2)
             with col1:
-                st.markdown("**Mapa de calor (densidade de permanência)**")
+                st.markdown(t("results.heatmap_title"))
                 _mostrar(analytics.plot_heatmap(centroides, fundo, zones=zones))
             with col2:
-                st.markdown("**Área explorada (envoltória convexa)**")
+                st.markdown(t("results.explored_area_title"))
                 _mostrar(analytics.plot_area_explorada(centroides, fundo),
-                         "A área explorada precisa de ao menos 3 detecções.")
+                         t("results.explored_area_needs_3"))
 
-        if tem_zonas:
-            with abas[3]:
-                render_zonas(centroides, indices, fundo, fps_video, zones,
-                             frame_skip, pixels_per_mm)
+        elif grupo == "zones":
+            render_zonas(centroides, indices, fundo, fps_video, zones,
+                         frame_skip, pixels_per_mm)
+
+
+def _tabela_placas(tids, rotulos, centroides, indices, track_ids, fundo, fps_video,
+                   limiar_parada_px, frames_processados, frame_skip, pixels_per_mm,
+                   zones, key_prefix):
+    """Tabela-resumo (uma linha por placa) com as métricas de calcular_metricas.
+
+    Valores crus + column_config (a ordenação funciona); uma unidade por coluna.
+    As colunas extras ficam atrás do toggle "Mostrar todas as métricas".
+    """
+    linhas, metricas = [], []
+    for tid in tids:
+        c, idx = analytics.subset_track(centroides, indices, track_ids, tid)
+        m = analytics.calcular_metricas(
+            c, idx, fps_video, limiar_parada_px,
+            frame_shape=fundo.shape if fundo is not None else None,
+            frames_processados=frames_processados, frame_skip=frame_skip,
+            pixels_per_mm=pixels_per_mm,
+        )
+        metricas.append(m)
+        area_ref = (analytics._area_poligono_px2(zones[tid]["points"])
+                    if zones and tid < len(zones) else None)
+        cobertura = (100.0 * m["area_explorada_px2"] / area_ref
+                     if area_ref and "area_explorada_px2" in m else m.get("cobertura_perc"))
+        linhas.append((tid, m, cobertura))
+
+    tem_mm = bool(pixels_per_mm and pixels_per_mm > 0)
+    tem_vel_mm = tem_mm and any("velocidade_media_mm_s" in m for m in metricas)
+    ud = "mm" if tem_mm else "px"
+    ua = "mm²" if tem_mm else "px²"
+    uv = "mm/s" if tem_vel_mm else next(
+        (m["unidade_v"] for m in metricas if "unidade_v" in m), "px/s")
+    ut = next((m["unidade_t"] for m in metricas if "unidade_t" in m), "s")
+    suf = "_mm" if tem_mm else "_px"
+    suf_v = "_mm_s" if tem_vel_mm else ""
+    suf_a = "_mm2" if tem_mm else "_px2"
+
+    dados = []
+    for tid, m, cobertura in linhas:
+        dados.append({
+            "dish": rotulos[tid],
+            "detections": m.get("deteccoes", 0),
+            "distance": m.get("distancia" + suf),
+            "speed_mean": m.get("velocidade_media" + suf_v),
+            "pct_moving": m.get("perc_movimento"),
+            "straightness": m.get("retilineidade"),
+            "net": m.get("deslocamento_liquido" + suf),
+            "speed_max": m.get("velocidade_max" + suf_v),
+            "time_moving": m.get("tempo_movimento"),
+            "time_stopped": m.get("tempo_parado"),
+            "time_detected": m.get("tempo_detectado"),
+            "pct_detected": m.get("perc_detectado"),
+            "area": m.get("area_explorada" + suf_a),
+            "coverage": cobertura,
+        })
+    df = pd.DataFrame(dados)
+    nc = st.column_config.NumberColumn
+    pc = st.column_config.ProgressColumn
+    cfg = {
+        "dish": st.column_config.TextColumn(t("results.col_dish")),
+        "detections": nc(t("results.col_detections"), format="%d"),
+        "distance": nc(t("results.col_distance", unit=ud),
+                       format="%.1f" if tem_mm else "%.0f"),
+        "speed_mean": nc(t("results.col_mean_speed", unit=uv), format="%.2f"),
+        "pct_moving": pc(t("results.col_pct_moving"), min_value=0, max_value=100,
+                         format="%.0f%%", help=t("results.time_moving_help",
+                                                 thr=limiar_parada_px)),
+        "straightness": nc(t("results.col_straightness"), format="%.2f",
+                           help=t("results.straightness_help")),
+        "net": nc(t("results.col_net_displacement", unit=ud),
+                  format="%.1f" if tem_mm else "%.0f"),
+        "speed_max": nc(t("results.col_max_speed", unit=uv), format="%.2f"),
+        "time_moving": nc(t("results.col_time_walking", unit=ut), format="%.1f"),
+        "time_stopped": nc(t("results.col_time_stopped", unit=ut), format="%.1f"),
+        "time_detected": nc(t("results.col_time_detected", unit=ut), format="%.1f"),
+        "pct_detected": pc(t("results.col_pct_detected"), min_value=0, max_value=100,
+                           format="%.0f%%"),
+        "area": nc(t("results.col_explored_area", unit=ua),
+                   format="%.1f" if tem_mm else "%.0f"),
+        "coverage": pc(t("results.col_coverage"), min_value=0, max_value=100,
+                       format="%.1f%%"),
+    }
+    principais = ["dish", "detections", "distance", "speed_mean", "pct_moving",
+                  "straightness"]
+    todas = st.toggle(t("results.show_all_metrics"), key=f"{key_prefix}todas_metricas")
+    ordem = [c for c in (list(df.columns) if todas else principais)
+             if c in df.columns and not df[c].isna().all()]
+    st.dataframe(df, hide_index=True, width="stretch", column_order=ordem,
+                 column_config=cfg)
 
 
 def render_resultados(centroides, indices, track_ids, fundo, fps_video,
@@ -794,70 +1041,51 @@ def render_resultados(centroides, indices, track_ids, fundo, fps_video,
         render_analytics(centroides, indices, fundo, fps_video, limiar_parada_px,
                          frames_processados=frames_processados, frame_skip=frame_skip,
                          pixels_per_mm=pixels_per_mm, zones=zones,
-                         area_ref_px2=area_ref)
+                         area_ref_px2=area_ref, key_prefix=key_prefix)
         return
 
     # Quando as áreas guiaram o rastreamento, rotula cada placa pelo nome da área.
-    def _rotulo(t):
-        if zones and t < len(zones):
-            return zones[t].get("name") or f"Abelha {t + 1}"
-        return f"Abelha {t + 1}"
+    # (variável `tid`, não `t`: `t` é a função de tradução do i18n)
+    def _rotulo(tid):
+        if zones and tid < len(zones):
+            return zones[tid].get("name") or t("results.bee_n", n=tid + 1)
+        return t("results.bee_n", n=tid + 1)
 
-    rotulos = {t: _rotulo(t) for t in tids}
+    rotulos = {tid: _rotulo(tid) for tid in tids}
 
-    with st.expander(f"🐝 Visão geral — {len(tids)} placas/abelhas", expanded=True):
+    with st.expander(t("results.overview_multi", n=len(tids)), expanded=True):
         if fundo is not None:
             _mostrar(analytics.plot_trajetorias_multi(
                 centroides, indices, track_ids, fundo, fps_video,
                 zones=zones, rotulos=rotulos))
+        _tabela_placas(tids, rotulos, centroides, indices, track_ids, fundo,
+                       fps_video, limiar_parada_px, frames_processados, frame_skip,
+                       pixels_per_mm, zones, key_prefix)
+        st.caption(_limiar_parada_txt(limiar_parada_px, pixels_per_mm, fps_video,
+                                      frame_skip))
 
-        # Tabela-resumo: uma linha por placa/abelha
-        linhas = []
-        for t in tids:
-            c, idx = analytics.subset_track(centroides, indices, track_ids, t)
-            m = analytics.calcular_metricas(
-                c, idx, fps_video, limiar_parada_px,
-                frame_shape=fundo.shape if fundo is not None else None,
-                frames_processados=frames_processados, frame_skip=frame_skip,
-                pixels_per_mm=pixels_per_mm,
-            )
-            tem_mm = "distancia_mm" in m
-            linha = {
-                "Placa": rotulos[t],
-                "Detecções": m.get("deteccoes", 0),
-            }
-            if tem_mm:
-                linha["Distância (mm)"] = f"{m['distancia_mm']:.1f}"
-                vel = (f"{m['velocidade_media_mm_s']:.2f} mm/s"
-                       if "velocidade_media_mm_s" in m
-                       else f"{m.get('velocidade_media', 0):.1f} {m.get('unidade_v', 'px/s')}")
-            else:
-                linha["Distância (px)"] = f"{m.get('distancia_px', 0):.0f}"
-                vel = f"{m.get('velocidade_media', 0):.1f} {m.get('unidade_v', 'px/s')}"
-            linha["Vel. média"] = vel
-            linha["Tempo mov."] = f"{m.get('perc_movimento', 0):.0f}%"
-            linhas.append(linha)
-        st.dataframe(pd.DataFrame(linhas), hide_index=True, width="stretch")
-
-    # Detalhamento completo de uma placa escolhida
-    opcoes = {rotulos[t]: t for t in tids}
-    rotulo = st.selectbox("Ver detalhes de:", list(opcoes.keys()),
-                          key=f"{key_prefix}sel_track_detalhe")
-    t = opcoes[rotulo]
-    c, idx = analytics.subset_track(centroides, indices, track_ids, t)
-    st.markdown(f"#### Detalhes — {rotulo}")
+    # Detalhamento completo de uma placa escolhida (opções = ids estáveis,
+    # o rótulo traduzido só aparece via format_func)
+    tid = st.pills(t("results.show_details_for"), list(tids), default=tids[0],
+                   required=True, format_func=lambda k: rotulos[k],
+                   key=f"{key_prefix}sel_track_detalhe")
+    if tid not in tids:
+        tid = tids[0]
+    c, idx = analytics.subset_track(centroides, indices, track_ids, tid)
+    st.markdown(t("results.details_title", label=rotulos[tid]))
     # Recorta o fundo na caixa da área (a abelha ocupa o quadro, não um ponto
     # minúsculo no frame inteiro). Distância é invariante à translação, então as
     # métricas não mudam; zones=None evita redesenhar o contorno em coords do
     # frame inteiro (o recorte já É a área).
-    fundo_t, c_t = (_recorte_area(fundo, c, zones[t])
-                    if zones and t < len(zones) else (fundo, c))
+    fundo_t, c_t = (_recorte_area(fundo, c, zones[tid])
+                    if zones and tid < len(zones) else (fundo, c))
     # Cobertura relativa à área delimitada (polígono da zona), não ao quadro.
-    area_ref = (analytics._area_poligono_px2(zones[t]["points"])
-                if zones and t < len(zones) else None)
+    area_ref = (analytics._area_poligono_px2(zones[tid]["points"])
+                if zones and tid < len(zones) else None)
     render_analytics(c_t, idx, fundo_t, fps_video, limiar_parada_px,
                      frames_processados=frames_processados, frame_skip=frame_skip,
-                     pixels_per_mm=pixels_per_mm, zones=None, area_ref_px2=area_ref)
+                     pixels_per_mm=pixels_per_mm, zones=None, area_ref_px2=area_ref,
+                     key_prefix=f"{key_prefix}det_")
 
 
 # --- Persistência das análises ---
@@ -908,6 +1136,9 @@ def salvar_analise(user_id, video_name, video_size, params, res: Resultado) -> i
 
 
 def csv_da_analise(centroides, indices_frames, track_ids=None) -> str:
+    """CSV da trajetória. O cabeçalho é FIXO (placa,frame,x,y) em qualquer
+    idioma da interface: é um formato para scripts (pandas/R) e para juntar
+    exportações de usuários diferentes. Só o nome do arquivo é traduzido."""
     dados = {"frame": indices_frames, "x": centroides[:, 0], "y": centroides[:, 1]}
     if track_ids is not None and len(np.asarray(track_ids).reshape(-1)):
         dados = {"placa": np.asarray(track_ids).reshape(-1) + 1, **dados}
@@ -916,63 +1147,140 @@ def csv_da_analise(centroides, indices_frames, track_ids=None) -> str:
 
 # --- Telas ---
 
+def _entrar(user: dict):
+    """Abre a sessão do usuário autenticado."""
+    st.session_state["user_id"] = user["id"]
+    st.session_state["username"] = user["username"]
+    st.session_state["role"] = user.get("role", "user")
+
+
 def tela_login():
     ui.inject_css()
     _, centro, _ = st.columns([1, 1.4, 1])
     with centro:
-        ui.header("Bee Tracker", "Detecção e rastreamento de abelhas com YOLOv4")
-        st.caption("Entre com a sua conta para ver e criar análises. "
-                   "Cada usuário enxerga apenas as próprias análises.")
+        i18n.language_selector()
+        ui.header(t("core.app_name"), t("core.app_subtitle"))
+        st.markdown(t("history.login_about"))
+        st.caption(t("history.login_caption"))
 
-        aba_entrar, aba_registrar = st.tabs(["🔑 Entrar", "✨ Criar conta"])
+        aba_entrar, aba_registrar = st.tabs([t("history.tab_login"), t("history.tab_register")])
 
         with aba_entrar:
             with st.form("form_login"):
-                usuario = st.text_input("Usuário")
-                senha = st.text_input("Senha", type="password")
-                if st.form_submit_button("Entrar", type="primary",
+                usuario = st.text_input(t("history.username"))
+                senha = st.text_input(t("history.password"), type="password")
+                if st.form_submit_button(t("history.login_button"), type="primary",
                                          width="stretch"):
                     user, erro = auth.login(usuario, senha)
                     if user:
-                        st.session_state["user_id"] = user["id"]
-                        st.session_state["username"] = user["username"]
-                        st.session_state["role"] = user.get("role", "user")
+                        _entrar(user)
                         st.rerun()
                     else:
                         st.error(erro)
 
         with aba_registrar:
             with st.form("form_registro"):
-                usuario = st.text_input("Usuário", help="Mínimo de 3 caracteres")
-                senha = st.text_input("Senha", type="password",
-                                      help="Mínimo de 6 caracteres")
-                confirma = st.text_input("Confirmar senha", type="password")
-                if st.form_submit_button("Criar conta", width="stretch"):
+                usuario = st.text_input(t("history.username"), help=t("history.username_help"))
+                senha = st.text_input(t("history.password"), type="password",
+                                      help=t("history.password_help"))
+                confirma = st.text_input(t("history.confirm_password"), type="password")
+                if st.form_submit_button(t("history.register_button"), width="stretch"):
                     if senha != confirma:
-                        st.error("As senhas não conferem.")
+                        st.error(t("history.passwords_mismatch"))
                     else:
                         ok, msg = auth.register(usuario, senha)
-                        if ok:
-                            st.success(msg)
-                        else:
+                        if not ok:
                             st.error(msg)
+                        else:
+                            # Conta criada: já entra com as mesmas credenciais.
+                            user, erro = auth.login(usuario, senha)
+                            if user:
+                                _entrar(user)
+                                ui.flash(t("history.register_welcome",
+                                           user=user["username"]))
+                                st.rerun()
+                            else:
+                                st.success(msg)
+                                st.error(erro)
+
+
+def _md_esc(texto):
+    """Escapa caracteres de markdown em textos do usuário (ex.: nome do vídeo)."""
+    s = str(texto)
+    for ch in "\\`*_[]#<>|~":
+        s = s.replace(ch, "\\" + ch)
+    return s
+
+
+def _fmt_data(created_at):
+    """'2026-11-10 14:33:02' -> data/hora curta no formato do idioma."""
+    try:
+        return datetime.strptime(str(created_at)[:19], "%Y-%m-%d %H:%M:%S").strftime(
+            t("history.date_strftime"))
+    except (TypeError, ValueError):
+        return str(created_at or "—")
+
+
+def _duracao_analisada(frames_processados, frame_skip, fps_video):
+    """Duração (s) do trecho analisado: amostras × intervalo entre amostras."""
+    try:
+        if fps_video and fps_video > 0 and frames_processados and frame_skip:
+            return float(frames_processados) * float(frame_skip) / float(fps_video)
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _linha_fatos(fatos):
+    """Linha compacta de fatos (rótulo pequeno + valor) num contêiner com borda."""
+    with st.container(border=True):
+        for col, (rotulo, valor) in zip(st.columns(len(fatos)), fatos):
+            col.caption(rotulo)
+            col.markdown(f"**{valor}**")
+
+
+def _parametros_tecnicos(itens):
+    """Expander 'Parâmetros técnicos' com os itens em duas colunas."""
+    with st.expander(t("history.tech_params")):
+        meio = (len(itens) + 1) // 2
+        for col, parte in zip(st.columns(2), (itens[:meio], itens[meio:])):
+            col.markdown("\n".join(f"- {rot}: **{val}**" for rot, val in parte))
+
+
+def _nome_trajetoria(analysis_id):
+    if analysis_id is None:
+        return t("history.file_trajectory_noid")
+    return t("history.file_trajectory", id=analysis_id)
 
 
 def exibir_resultados(res: Resultado, frame_skip: int, limiar_parada_px: float,
-                      pixels_per_mm: float | None = None, zones=None):
+                      pixels_per_mm: float | None = None, zones=None, conf=None):
     if len(res.centroides) == 0:
-        st.warning("Nenhuma abelha detectada nos frames processados com os parâmetros atuais.")
-        st.info("Dicas: reduza o limiar de confiança ou o salto de frames na barra lateral.")
+        st.warning(t("history.no_bees_detected"))
+        # Dica com os rótulos exatos da barra lateral e os valores usados.
+        st.info(t("analysis.no_bees_tips", settings=t("sidebar.settings"),
+                  section=t("sidebar.detection"),
+                  conf_label=t("sidebar.conf_threshold"),
+                  conf=f"{conf:.2f}" if conf is not None else "—",
+                  skip_label=t("sidebar.frame_skip"), skip=frame_skip,
+                  zones_tool=t("analysis.tool_zones")))
         return
 
-    st.caption(
-        f"Processado em {res.tempo_s:.1f} s a {res.fps_processamento:.1f} frames/s — "
-        f"{res.frames_processados}/{res.total_frames} frames (1 a cada {frame_skip})."
-    )
+    analysis_id = (st.session_state.get("resultado_resumo") or {}).get("id")
+    _parametros_tecnicos([
+        (t("history.tp_processing_time"), _fmt_duracao(res.tempo_s)),
+        (t("history.tp_processing_speed"),
+         t("history.tp_fps_value", fps=res.fps_processamento)),
+        (t("history.tp_frames"), t("history.tp_frames_value",
+                                   done=res.frames_processados, total=res.total_frames)),
+        (t("history.tp_frame_skip"), t("history.tp_frame_skip_value", skip=frame_skip)),
+        (t("history.tp_conf"), f"{conf:.2f}" if conf is not None else "—"),
+        (t("history.tp_video_fps"), f"{res.fps_video:.1f}" if res.fps_video else "—"),
+    ])
     st.download_button(
-        "⬇️ Baixar trajetória (CSV)",
+        t("history.download_trajectory_csv"),
         data=csv_da_analise(res.centroides, res.indices_frames, res.track_ids),
-        file_name="trajetoria.csv", mime="text/csv",
+        file_name=_nome_trajetoria(analysis_id), mime="text/csv", on_click="ignore",
     )
     render_resultados(res.centroides, res.indices_frames, res.track_ids,
                       res.primeiro_frame, res.fps_video, limiar_parada_px,
@@ -999,22 +1307,52 @@ def exibir_analise_salva(analise: dict, user_id: int, limiar_parada_px: float):
             zonas_salvas = json.loads(analise["zones"])
         except (ValueError, TypeError):
             zonas_salvas = None
-    st.markdown(f"### Análise #{analise['id']} — {analise['video_name']}")
-    st.caption(
-        f"Processada em {analise['created_at']} | backend: {analise['backend']} | "
-        f"frame skip: {analise['frame_skip']} | rede: {analise['input_size']}px | "
-        f"confiança: {analise['conf_threshold']} | NMS: {analise['nms_threshold']} | "
-        f"tempo de processamento: {analise['processing_time_s']:.1f} s"
-        + (f" | escala: {escala_salva:.2f} px/mm" if escala_salva else "")
-        + (f" | {len(zonas_salvas)} área(s)" if zonas_salvas else "")
-    )
+
+    # Cabeçalho: fatos essenciais numa linha; detalhes técnicos no expander.
+    st.markdown(t("history.analysis_title", id=analise['id']))
+    n_placas = (len(zonas_salvas) if zonas_salvas
+                else analise.get("num_targets") or 1)
+    duracao = _duracao_analisada(analise.get("frames_processed"),
+                                 analise.get("frame_skip"), analise.get("fps_video"))
+    _linha_fatos([
+        (t("history.fact_video"), _md_esc(analise["video_name"])),
+        (t("history.fact_date"), _fmt_data(analise["created_at"])),
+        (t("history.fact_dishes"), t("history.fact_dishes_value", n=n_placas)
+         if zonas_salvas else str(n_placas)),
+        (t("history.fact_scale"), f"{escala_salva:.2f} px/mm" if escala_salva
+         else t("history.fact_no_scale")),
+        (t("history.fact_duration"), _fmt_duracao(duracao) if duracao is not None
+         else "—"),
+    ])
+
+    def _num(v, fmt):
+        return fmt.format(v) if isinstance(v, (int, float)) else "—"
+
+    _parametros_tecnicos([
+        (t("history.tp_backend"), rotulo_backend(analise.get("backend"))),
+        (t("history.tp_input_size"), _num(analise.get("input_size"), "{} px")),
+        (t("history.tp_conf"), _num(analise.get("conf_threshold"), "{:.2f}")),
+        (t("history.tp_nms"), _num(analise.get("nms_threshold"), "{:.2f}")),
+        (t("history.tp_frame_skip"),
+         t("history.tp_frame_skip_value", skip=analise.get("frame_skip") or "—")),
+        (t("history.tp_frames"),
+         t("history.tp_frames_value", done=analise.get("frames_processed") or 0,
+           total=analise.get("total_frames") or 0)),
+        (t("history.tp_video_fps"), _num(analise.get("fps_video"), "{:.1f}")),
+        (t("history.tp_processing_time"),
+         _fmt_duracao(analise["processing_time_s"])
+         if analise.get("processing_time_s") is not None else "—"),
+        (t("history.tp_processing_speed"),
+         t("history.tp_fps_value", fps=analise["fps_processing"])
+         if analise.get("fps_processing") else "—"),
+    ])
 
     if centroides is not None and len(centroides) > 0:
         st.download_button(
-            "⬇️ Baixar trajetória (CSV)",
+            t("history.download_trajectory_csv"),
             data=csv_da_analise(centroides, indices, track_ids),
-            file_name=f"analise_{analise['id']}_trajetoria.csv",
-            mime="text/csv",
+            file_name=_nome_trajetoria(analise["id"]),
+            mime="text/csv", on_click="ignore",
         )
         render_resultados(centroides, indices, track_ids, fundo,
                           analise["fps_video"], limiar_parada_px,
@@ -1023,102 +1361,234 @@ def exibir_analise_salva(analise: dict, user_id: int, limiar_parada_px: float):
                           pixels_per_mm=escala_salva, zones=zonas_salvas,
                           key_prefix=f"hist{analise['id']}_")
     else:
-        st.info("Esta análise não registrou detecções.")
+        st.info(t("history.no_detections_saved"))
 
     st.markdown("---")
-    if st.button("🗑️ Excluir esta análise", key=f"excluir_{analise['id']}"):
-        database.delete_analysis(analise["id"], user_id)
-        log_event("analysis_deleted", f"Análise #{analise['id']} excluída",
-                  user_id=user_id, analysis_id=analise["id"])
-        st.rerun()
+    if st.button(t("history.delete_analysis"), key=f"excluir_{analise['id']}"):
+        def _excluir(aid=analise["id"]):
+            database.delete_analysis(aid, user_id)
+            log_event("analysis_deleted", f"Análise #{aid} excluída",
+                      user_id=user_id, analysis_id=aid)
+            if st.session_state.get("_keep_hist_analise") == aid:
+                st.session_state.pop("_keep_hist_analise", None)
+        ui.confirm_delete(
+            t("history.delete_dialog_title", id=analise["id"]),
+            t("history.delete_dialog_body", id=analise["id"],
+              video=ui.esc(analise["video_name"]), created=analise["created_at"]),
+            _excluir, t("history.delete_done", id=analise["id"]),
+            key="dlg_excluir_analise")
+
+
+def _tabela_historico(analises) -> pd.DataFrame:
+    """Resumo das análises com valores crus (datas/números), colunas internas."""
+    linhas = []
+    for a in analises:
+        escala = a.get("pixels_per_mm")
+        dist_px = a.get("distance_px")
+        linhas.append({
+            "id": a["id"],
+            "created_at": pd.to_datetime(a.get("created_at"), errors="coerce"),
+            "video_name": a.get("video_name"),
+            "dishes": a.get("num_targets") or 1,
+            "detections": a.get("detections"),
+            "distance_mm": (dist_px / escala) if (dist_px is not None and escala
+                                                  and escala > 0) else None,
+            "distance_px": dist_px,
+            "duration_s": _duracao_analisada(a.get("frames_processed"),
+                                             a.get("frame_skip"), a.get("fps_video")),
+            "scale": escala if escala and escala > 0 else None,
+            "frame_skip": a.get("frame_skip"),
+            "conf": a.get("conf_threshold"),
+            "backend": rotulo_backend(a.get("backend")),
+            "processing_time_s": a.get("processing_time_s"),
+        })
+    return pd.DataFrame(linhas)
+
+
+def _config_historico():
+    nc = st.column_config.NumberColumn
+    return {
+        "id": nc(t("history.col_id"), format="#%d", width="small"),
+        "created_at": st.column_config.DatetimeColumn(
+            t("history.col_date"), format=t("history.date_column_format")),
+        "video_name": st.column_config.TextColumn(t("history.col_video")),
+        "dishes": nc(t("history.col_dishes"), format="%d"),
+        "detections": nc(t("history.col_detections"), format="%d"),
+        "distance_mm": nc(t("history.col_distance", unit="mm"), format="%.1f"),
+        "distance_px": nc(t("history.col_distance", unit="px"), format="%.0f"),
+        "duration_s": nc(t("history.col_duration_s"), format="%.0f"),
+        "scale": nc(t("history.col_scale"), format="%.2f"),
+        "frame_skip": nc(t("history.col_frame_skip"), format="%d"),
+        "conf": nc(t("history.col_conf"), format="%.2f"),
+        "backend": st.column_config.TextColumn(t("history.col_backend")),
+        "processing_time_s": nc(t("history.col_time_s"), format="%.1f"),
+    }
+
+
+def _csv_historico(df: pd.DataFrame) -> bytes:
+    """CSV do resumo: valores crus, cabeçalhos traduzidos com unidade."""
+    rotulos = {k: v["label"] if isinstance(v, dict) else k
+               for k, v in _config_historico().items()}
+    out = df.copy()
+    out["created_at"] = out["created_at"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    return out.rename(columns=rotulos).to_csv(index=False).encode("utf-8")
+
+
+def _exportar_todas(user_id, username, analises, df, limiar_parada_px):
+    """Popover com as exportações de TODAS as análises (CSV / Excel / PDF).
+
+    Os relatórios gerados ficam em session_state junto de uma "impressão
+    digital" (análises + limiar + idioma); se o conjunto mudar, são descartados.
+    """
+    hoje = datetime.now().strftime("%Y-%m-%d")
+    impressao = (tuple(a["id"] for a in analises), float(limiar_parada_px),
+                 i18n.get_lang())
+    for chave in ("relatorio_xlsx", "relatorio_pdf"):
+        guardado = st.session_state.get(chave)
+        if not (isinstance(guardado, tuple) and guardado[0] == impressao):
+            st.session_state.pop(chave, None)
+
+    with st.popover(t("history.export_all"), width="stretch"):
+        st.caption(t("history.export_all_caption", n=len(analises)))
+        col_csv, col_xlsx, col_pdf = st.columns(3)
+        with col_csv:
+            st.download_button(
+                t("history.summary_csv"), data=_csv_historico(df),
+                file_name=t("history.file_summary_csv", date=hoje), mime="text/csv",
+                width="stretch", on_click="ignore", key="exp_csv",
+            )
+
+        formatos = [
+            (col_xlsx, "relatorio_xlsx", "xlsx", report.build_excel,
+             t("history.generate_excel"), t("history.download_excel"),
+             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+             "report_excel_generated", "history.excel_failed"),
+            (col_pdf, "relatorio_pdf", "pdf", report.build_pdf,
+             t("history.generate_pdf"), t("history.download_pdf"),
+             "application/pdf", "report_generated", "history.report_failed"),
+        ]
+        for col, chave, ext, construir, rot_gerar, rot_baixar, mime, evento, erro_key \
+                in formatos:
+            with col:
+                slot = st.empty()
+                if chave not in st.session_state:
+                    if not slot.button(rot_gerar, width="stretch", key=f"gerar_{ext}"):
+                        continue
+                    with st.spinner(t("history.building_report")):
+                        try:
+                            dados = construir(database.list_analyses_full(user_id),
+                                              username, limiar_parada_px)
+                            st.session_state[chave] = (impressao, dados)
+                            log_event(evento,
+                                      f"Relatório {ext.upper()} gerado "
+                                      f"({len(analises)} análises)", user_id=user_id)
+                        except Exception as e:
+                            slot.error(t(erro_key, error=e))
+                            log_event("report_failed", f"Erro no relatório: {e}",
+                                      user_id=user_id, level=logging.ERROR)
+                            continue
+                slot.download_button(
+                    rot_baixar, data=st.session_state[chave][1],
+                    file_name=t("history.file_report", date=hoje) + f".{ext}",
+                    mime=mime, width="stretch", on_click="ignore", type="primary",
+                    key=f"baixar_{ext}",
+                )
 
 
 def render_historico(user_id: int, username: str, limiar_parada_px: float):
     analises = database.list_analyses(user_id)
     if not analises:
-        st.info("Você ainda não tem análises salvas. "
-                "Processe um vídeo na aba 'Nova Análise'.")
+        st.info(t("history.empty"))
+        if st.button(t("analysis.go_new"), type="primary", key="hist_ir_nova"):
+            go_to("new")
     else:
-        st.caption(f"{len(analises)} análise(s) — visíveis apenas para a sua conta.")
-        df = pd.DataFrame(analises)[[
-            "id", "created_at", "video_name", "detections",
-            "distance_px", "frame_skip", "backend", "processing_time_s",
-        ]].rename(columns={
-            "id": "ID", "created_at": "Data", "video_name": "Vídeo",
-            "detections": "Detecções", "distance_px": "Distância (px)",
-            "frame_skip": "Frame skip", "backend": "Backend",
-            "processing_time_s": "Tempo (s)",
-        })
-        st.dataframe(df, hide_index=True, width="stretch")
+        df_todas = _tabela_historico(analises)
+        c_filtro, c_exportar = st.columns([3, 1], vertical_alignment="bottom")
+        filtro = c_filtro.text_input(
+            t("history.filter_label"), key="hist_filtro",
+            placeholder=t("history.filter_placeholder"), icon=":material/search:",
+        )
+        with c_exportar:
+            _exportar_todas(user_id, username, analises, df_todas, limiar_parada_px)
 
-        # --- Relatório geral consolidado ---
-        st.markdown("#### Relatório geral")
-        col_csv, col_xlsx, col_pdf = st.columns(3)
-        with col_csv:
-            st.download_button(
-                "⬇️ Resumo (CSV)",
-                data=df.to_csv(index=False).encode("utf-8"),
-                file_name="resumo_analises.csv", mime="text/csv",
-                width="stretch",
+        termo = (filtro or "").strip().lower()
+        df = (df_todas[df_todas["video_name"].fillna("").str.lower().str.contains(
+            termo, regex=False)] if termo else df_todas).reset_index(drop=True)
+        ids = [int(i) for i in df["id"]]
+        st.caption(t("history.count_caption", n=len(analises)) if not termo else
+                   t("history.count_filtered", n=len(ids), total=len(analises)))
+        if not ids:
+            st.info(t("history.filter_no_match", term=filtro.strip()))
+        else:
+            # A tabela é o seletor. A chave muda só quando o conjunto exibido muda
+            # (filtro, análise nova/excluída): aí a seleção recomeça a partir da
+            # análise aberta (selection_default), em vez de apontar p/ outra linha.
+            assinatura = zlib.crc32(",".join(map(str, ids)).encode())
+            chave_tbl = f"hist_tbl_{assinatura}"
+            aberta = st.session_state.get("_keep_hist_analise")
+            linha_padrao = ids.index(aberta) if aberta in ids else 0
+            visiveis = ["id", "created_at", "video_name", "dishes", "detections"]
+            if df["distance_mm"].notna().any():
+                visiveis.append("distance_mm")
+            visiveis += ["distance_px", "duration_s"]
+            evento = st.dataframe(
+                df, hide_index=True, width="stretch", key=chave_tbl,
+                on_select="rerun", selection_mode="single-row",
+                selection_default={"selection": {"rows": [linha_padrao]}},
+                column_order=visiveis, column_config=_config_historico(),
+                height=min(38 + 35 * len(ids), 300),
             )
-        with col_xlsx:
-            if st.button("📊 Gerar Excel", width="stretch"):
-                try:
-                    st.session_state["relatorio_xlsx"] = report.build_excel(
-                        database.list_analyses_full(user_id), username,
-                        limiar_parada_px)
-                    log_event("report_excel_generated",
-                              f"Relatório Excel gerado ({len(analises)} análises)",
-                              user_id=user_id)
-                except Exception as e:
-                    st.error(f"Falha ao gerar Excel: {e}")
-            if st.session_state.get("relatorio_xlsx"):
-                st.download_button(
-                    "⬇️ Baixar (Excel)",
-                    data=st.session_state["relatorio_xlsx"],
-                    file_name="relatorio_bee_tracker.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    width="stretch",
-                )
-        with col_pdf:
-            if st.button("📄 Gerar relatório (PDF)", width="stretch"):
-                with st.spinner("Montando relatório com métricas e gráficos..."):
-                    try:
-                        st.session_state["relatorio_pdf"] = report.build_pdf(
-                            database.list_analyses_full(user_id), username,
-                            limiar_parada_px,
-                        )
-                        log_event("report_generated",
-                                  f"Relatório PDF gerado ({len(analises)} análises)",
-                                  user_id=user_id)
-                    except Exception as e:
-                        st.error(f"Falha ao gerar relatório: {e}")
-                        log_event("report_failed", f"Erro no relatório: {e}",
-                                  user_id=user_id, level=logging.ERROR)
-        if st.session_state.get("relatorio_pdf"):
-            st.download_button(
-                "⬇️ Baixar relatório (PDF)",
-                data=st.session_state["relatorio_pdf"],
-                file_name="relatorio_bee_tracker.pdf", mime="application/pdf",
-            )
+            try:
+                linhas = list(evento["selection"]["rows"])
+            except (KeyError, TypeError):
+                linhas = []
+            if linhas and 0 <= linhas[0] < len(ids):
+                analise_id = ids[linhas[0]]
+                st.session_state["_keep_hist_analise"] = analise_id
+            else:
+                # Nada selecionado: abre a mais recente (lista já vem ordenada).
+                analise_id = ids[0]
+                st.caption(t("history.select_hint"))
+            analise = database.get_analysis(analise_id, user_id)
+            if analise:
+                st.markdown("---")
+                exibir_analise_salva(analise, user_id, limiar_parada_px)
 
-        st.markdown("---")
-        opcoes = {
-            f"#{a['id']} — {a['video_name']} ({a['created_at']})": a["id"]
-            for a in analises
-        }
-        rotulo = st.selectbox("Abrir análise", list(opcoes.keys()))
-        analise = database.get_analysis(opcoes[rotulo], user_id)
-        if analise:
-            exibir_analise_salva(analise, user_id, limiar_parada_px)
-
-    with st.expander("📜 Histórico de atividade da conta"):
+    with st.expander(t("history.activity_log")):
         eventos = database.list_logs(user_id=user_id, limit=100)
         if eventos:
-            st.dataframe(pd.DataFrame(eventos), hide_index=True,
-                         width="stretch")
+            _tabela_atividade(eventos)
         else:
-            st.caption("Sem eventos registrados.")
+            st.caption(t("history.no_events"))
+
+
+def _tabela_atividade(eventos):
+    """Log de atividade da conta com rótulos traduzidos.
+
+    O evento (código estável, ex.: "analysis_completed") vira uma descrição
+    no idioma atual (log.<evento>; sem tradução, mostra o próprio código). O
+    texto livre do registro é gravado em português, então só aparece em pt."""
+    catalogo = i18n.catalog(i18n.get_lang())
+    niveis = {"INFO": t("history.log_level_info"),
+              "WARNING": t("history.log_level_warning"),
+              "ERROR": t("history.log_level_error")}
+    df = pd.DataFrame(eventos)
+    df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+    df["level"] = df["level"].map(lambda n: niveis.get(str(n), n))
+    df["event"] = df["event"].map(
+        lambda e: t(f"log.{e}") if f"log.{e}" in catalogo else e)
+    colunas = ["ts", "level", "event"]
+    if i18n.get_lang() == "pt":
+        colunas.append("message")
+    st.dataframe(df, hide_index=True, width="stretch", column_order=colunas,
+                 column_config={
+                     "ts": st.column_config.DatetimeColumn(
+                         t("history.col_date"), format=t("history.date_column_format")),
+                     "level": st.column_config.TextColumn(t("history.col_log_level")),
+                     "event": st.column_config.TextColumn(t("history.col_log_event")),
+                     "message": st.column_config.TextColumn(
+                         t("history.col_log_details")),
+                 })
 
 
 def _patch_canvas_compat():
@@ -1207,6 +1677,32 @@ def _fmt_hms(s):
     return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
 
 
+def _fmt_duracao(s):
+    """Segundos -> duração curta legível ('8.3 s', '2 min 14 s', '1 h 05 min')."""
+    s = max(0.0, float(s))
+    if s < 60:
+        return f"{s:.1f} s" if s < 10 else f"{s:.0f} s"
+    s = int(round(s))
+    if s < 3600:
+        return f"{s // 60} min {s % 60:02d} s"
+    return f"{s // 3600} h {(s % 3600) // 60:02d} min"
+
+
+def _fps_video(video_path):
+    """FPS do vídeo (cacheado por sessão) — para estimar os frames amostrados."""
+    cache = st.session_state.get("_fps_cache")
+    if cache and cache[0] == video_path:
+        return cache[1]
+    cap = cv2.VideoCapture(video_path)
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    cap.release()
+    st.session_state["_fps_cache"] = (video_path, fps)
+    return fps
+
+
+CANVAS_MAX_W = 600   # largura máxima dos canvases de desenho (cabe em laptops)
+
+
 def ferramenta_calibracao(video_path):
     """Permite desenhar uma linha sobre objeto de medida conhecida -> px/mm."""
     try:
@@ -1214,9 +1710,9 @@ def ferramenta_calibracao(video_path):
         from streamlit_drawable_canvas import st_canvas
         from PIL import Image
     except Exception:
-        st.info("Componente de desenho indisponível. Informe a escala manualmente:")
+        st.info(t("calib.canvas_unavailable"))
         st.session_state["pixels_per_mm"] = st.number_input(
-            "Escala (pixels por mm)", min_value=0.0,
+            t("calib.scale_input"), min_value=0.0,
             value=float(st.session_state.get("pixels_per_mm", 0.0)),
             step=0.1, format="%.2f",
         )
@@ -1224,57 +1720,61 @@ def ferramenta_calibracao(video_path):
 
     frame = _primeiro_frame(video_path)
     if frame is None:
-        st.warning("Não foi possível ler o primeiro frame para calibração.")
+        st.warning(t("calib.first_frame_error"))
         return
 
     altura, largura = frame.shape[:2]
     pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-    st.markdown(
-        "Desenhe **uma linha reta** (clique e arraste) sobre um objeto cujo "
-        "comprimento real você conhece — ex.: o diâmetro da placa de Petri — "
-        "e informe esse comprimento em milímetros."
-    )
 
-    canvas_w = max(1, min(largura, 700))
+    # 1º o comprimento real (o que o usuário precisa saber antes de desenhar).
+    col_mm, _ = st.columns([1, 2])
+    with col_mm:
+        comprimento_mm = st.number_input(
+            t("calib.real_length"), min_value=0.01, value=100.0, step=0.1,
+            key="comprimento_mm", help=t("calib.real_length_help"))
+    st.markdown(t("calib.instructions", compute=t("calib.compute_scale")))
+
+    canvas_w = max(1, min(largura, CANVAS_MAX_W))
     canvas_h = int(altura * canvas_w / largura)
-    col_canvas, col_input = st.columns([3, 1])
-    with col_canvas:
-        canvas = st_canvas(
-            fill_color="rgba(0,0,0,0)", stroke_width=3, stroke_color="#FF0000",
-            background_image=pil, update_streamlit=True,
-            height=canvas_h, width=canvas_w, drawing_mode="line", key="canvas_calib",
-        )
-    with col_input:
-        comprimento_mm = st.number_input("Comprimento real (mm)", min_value=0.01,
-                                         value=100.0, step=0.1, key="comprimento_mm")
-        if st.button("Calcular escala"):
-            objetos = (canvas.json_data or {}).get("objects") if canvas else None
-            linhas = [o for o in (objetos or []) if o.get("type") == "line"]
-            if not linhas:
-                st.error("Desenhe uma linha reta sobre o objeto primeiro.")
+    canvas = st_canvas(
+        fill_color="rgba(0,0,0,0)", stroke_width=3, stroke_color="#FF0000",
+        background_image=pil, update_streamlit=True,
+        height=canvas_h, width=canvas_w, drawing_mode="line", key="canvas_calib",
+    )
+    escala = st.session_state.get("pixels_per_mm", 0.0)
+    col_calc, col_limpar, _ = st.columns([1, 1, 2])
+    with col_calc:
+        calcular = st.button(t("calib.compute_scale"), type="primary", width="stretch")
+    with col_limpar:
+        limpar = st.button(t("calib.clear_scale"), disabled=not escala > 0,
+                           width="stretch")
+    if calcular:
+        objetos = (canvas.json_data or {}).get("objects") if canvas else None
+        linhas = [o for o in (objetos or []) if o.get("type") == "line"]
+        if not linhas:
+            st.error(t("calib.draw_line_first"))
+        else:
+            o = linhas[-1]
+            # O comprimento (x2-x1, y2-y1) independe de left/top: o
+            # deslocamento entre extremos é invariante ao centro do objeto.
+            comp_canvas = float(np.hypot(o["x2"] - o["x1"], o["y2"] - o["y1"]))
+            comp_imagem = comp_canvas * (largura / canvas_w)  # canvas -> resolução real
+            if comp_imagem > 0:
+                escala = comp_imagem / comprimento_mm
+                st.session_state["pixels_per_mm"] = escala
+                st.success(t("calib.scale_result", escala=escala,
+                             px=comp_imagem, mm=comprimento_mm))
             else:
-                o = linhas[-1]
-                # O comprimento (x2-x1, y2-y1) independe de left/top: o
-                # deslocamento entre extremos é invariante ao centro do objeto.
-                comp_canvas = float(np.hypot(o["x2"] - o["x1"], o["y2"] - o["y1"]))
-                comp_imagem = comp_canvas * (largura / canvas_w)  # canvas -> resolução real
-                if comp_imagem > 0:
-                    escala = comp_imagem / comprimento_mm
-                    st.session_state["pixels_per_mm"] = escala
-                    st.success(f"Escala: {escala:.2f} px/mm "
-                               f"({comp_imagem:.0f} px = {comprimento_mm:.2f} mm)")
-                else:
-                    st.error("Linha de comprimento zero. Desenhe novamente.")
+                st.error(t("calib.zero_length"))
+    if limpar:
+        st.session_state["pixels_per_mm"] = 0.0
+        st.rerun()
 
     escala = st.session_state.get("pixels_per_mm", 0.0)
     if escala > 0:
-        st.caption(f"Escala atual: **{escala:.2f} px/mm**. "
-                   "As métricas em mm aparecerão nos resultados.")
-        if st.button("Limpar escala"):
-            st.session_state["pixels_per_mm"] = 0.0
-            st.rerun()
+        st.caption(t("calib.current_scale", escala=escala))
     else:
-        st.caption("Sem escala definida — resultados apenas em pixels.")
+        st.caption(t("calib.no_scale"))
 
 
 def _poligono_do_objeto(obj, escala, n_circulo=40):
@@ -1505,6 +2005,23 @@ class _GravadorAnotado:
             self.proc.kill()
         return self.path if os.path.exists(self.path) else None
 
+    def descartar(self):
+        """Aborta a gravação (processamento interrompido) e apaga o MP4 parcial."""
+        if self.proc is not None:
+            try:
+                self.proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                self.proc.kill()
+                self.proc.wait(timeout=10)
+            except Exception:
+                pass
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
+
 
 def _desenhar_anotacoes(img, zone_polys, raw_boxes, aceitos):
     """Desenha áreas (laranja), detecções brutas do YOLO (amarelo, com confiança)
@@ -1526,6 +2043,33 @@ def _desenhar_anotacoes(img, zone_polys, raw_boxes, aceitos):
     return img
 
 
+def _modo_ajuste_canvas():
+    """drawing_mode para mover/excluir formas, conforme a versão instalada do
+    streamlit-drawable-canvas: "transform" (≤0.9), "edit" (0.10–0.11) ou None
+    (≥0.12: a edição virou um botão da barra do canvas, ativo em qualquer modo,
+    e passar "transform"/"edit" levanta ValueError)."""
+    try:
+        import streamlit_drawable_canvas as _sdc
+    except Exception:
+        return "transform"
+    validos = getattr(_sdc, "_VALID_DRAWING_MODES", None)
+    if not validos:
+        return "transform"
+    return next((m for m in ("transform", "edit") if m in validos), None)
+
+
+def _sincronizar_nomes_zonas(zonas):
+    """Alinha os campos de nome das áreas (zona_nome_i) às áreas recriadas.
+
+    Um text_input com key ignora `value=` depois de criado: sem isto, ao
+    recriar as áreas (detectar, salvar, limpar) os campos devolveriam os nomes
+    antigos e sobrescreveriam os novos. Chamar antes de desenhar os campos."""
+    for k in [k for k in st.session_state if str(k).startswith("zona_nome_")]:
+        del st.session_state[k]
+    for i, z in enumerate(zonas or []):
+        st.session_state[f"zona_nome_{i}"] = z["name"]
+
+
 def ferramenta_zonas(video_path):
     """Permite desenhar polígonos sobre o frame para definir áreas de monitoramento."""
     try:
@@ -1533,46 +2077,98 @@ def ferramenta_zonas(video_path):
         from streamlit_drawable_canvas import st_canvas
         from PIL import Image
     except Exception:
-        st.info("Componente de desenho indisponível — não é possível definir áreas "
-                "nesta instalação.")
+        st.info(t("analysis.canvas_unavailable_zones"))
         return
 
     frame = _primeiro_frame(video_path)
     if frame is None:
-        st.warning("Não foi possível ler o primeiro frame para definir áreas.")
+        st.warning(t("analysis.first_frame_unreadable_zones"))
         return
 
     altura, largura = frame.shape[:2]
     pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    zonas = st.session_state.get("zones") or []
+    rotulo_salvar = t("analysis.save_drawn_zones")
 
+    # --- Caminho principal: detecção automática das placas (Hough) ---
+    st.markdown(t("analysis.hough_title"))
+    st.caption(t("analysis.hough_caption"))
+    col_n, col_btn = st.columns([1, 1], vertical_alignment="bottom")
+    with col_n:
+        n_placas_auto = st.number_input(
+            t("analysis.hough_n"), min_value=1, max_value=30,
+            value=max(1, min(30, len(zonas) or 1)), key="hough_n",
+            help=t("analysis.hough_n_help"),
+        )
+    with col_btn:
+        detectar = st.button(t("analysis.hough_detect"), type="primary",
+                             width="stretch")
+    with st.expander(t("analysis.hough_params")):
+        param2 = st.slider(
+            t("analysis.hough_sensitivity"), 10, 100, 30, key="hough_p2",
+            help=t("analysis.hough_sensitivity_help"),
+        )
+        raio_min = st.slider(t("analysis.hough_rmin"), 1, 30, 5, key="hough_rmin",
+                             help=t("analysis.hough_size_help")) / 100.0
+        raio_max = st.slider(t("analysis.hough_rmax"), 5, 60, 25, key="hough_rmax",
+                             help=t("analysis.hough_size_help")) / 100.0
+    if detectar:
+        circulos = _detectar_placas_hough(
+            frame, int(n_placas_auto), param2, raio_min, raio_max)
+        if not circulos:
+            st.warning(t("analysis.hough_none", fine=t("analysis.hough_params"),
+                         rigor=t("analysis.hough_sensitivity")))
+        else:
+            # Já salva as placas como áreas e as injeta no canvas para ajuste:
+            # se o usuário corrigir alguma, clica em Salvar de novo.
+            prefixo = (st.session_state.get("zonas_prefixo")
+                       or t("analysis.zone_name_default"))
+            st.session_state["zones"] = [
+                {"name": f"{prefixo} {i + 1}", "points": _circulo_para_poligono(cx, cy, r)}
+                for i, (cx, cy, r) in enumerate(circulos)
+            ]
+            st.session_state["zonas_hough_circ"] = circulos
+            _sincronizar_nomes_zonas(st.session_state["zones"])
+            st.session_state["zona_forcar_ajuste"] = True  # já entra no modo ajustar
+            ui.flash(t("analysis.hough_found", n=len(circulos), save=rotulo_salvar))
+            st.rerun()
+
+    # --- Desenho / ajuste manual ---
+    st.markdown(t("analysis.manual_title"))
     # Após "Detectar placas", já entra no modo de ajuste (definido antes do widget,
     # pois não se pode alterar o session_state de um widget já instanciado).
+    # "transform" é o valor interno estável da opção Ajustar; o modo real do
+    # canvas vem de _modo_ajuste_canvas(). Sem modo de ajuste (canvas ≥0.12),
+    # a opção some e a edição fica no botão da barra do próprio canvas.
+    modo_ajuste = _modo_ajuste_canvas()
+    _formatos = {
+        "polygon": t("analysis.zone_shape_polygon"),
+        "circle": t("analysis.zone_shape_circle"),
+    }
+    if modo_ajuste:
+        _formatos["transform"] = t("analysis.zone_shape_adjust")
+    if st.session_state.get("zona_formato") not in (None, *_formatos):
+        st.session_state.pop("zona_formato", None)  # valor antigo (rótulo)
     if st.session_state.pop("zona_forcar_ajuste", False):
-        st.session_state["zona_formato"] = "✏️ Ajustar (mover/excluir)"
+        st.session_state["zona_formato"] = "transform" if modo_ajuste else "circle"
 
     formato = st.radio(
-        "Formato da área", ["Polígono", "Círculo / elipse", "✏️ Ajustar (mover/excluir)"],
+        t("analysis.zone_shape"), list(_formatos), format_func=_formatos.get,
         horizontal=True, key="zona_formato",
     )
-    modo = {"Polígono": "polygon", "Círculo / elipse": "circle"}.get(formato, "transform")
-    if modo == "polygon":
-        st.markdown(
-            "Desenhe **um polígono por área**: clique em cada vértice e **clique de "
-            "novo no primeiro ponto** para fechar. Depois clique em *Salvar áreas*."
-        )
-    elif modo == "circle":
-        st.markdown(
-            "Desenhe **um círculo por área**: clique e arraste para definir o "
-            "tamanho. Depois clique em *Salvar áreas*."
-        )
+    if formato not in _formatos:
+        formato = "circle"
+    modo = modo_ajuste if formato == "transform" else formato
+    if formato == "polygon":
+        st.markdown(t("analysis.help_polygon"))
+    elif formato == "circle":
+        st.markdown(t("analysis.help_circle"))
     else:
-        st.markdown(
-            "Modo **ajuste**: clique numa forma para selecioná-la, arraste para "
-            "mover ou redimensionar e use o ícone de **lixeira** (barra do canvas) "
-            "para excluir. Útil para corrigir as placas detectadas automaticamente."
-        )
+        st.markdown(t("analysis.help_adjust"))
+    if not modo_ajuste:
+        st.caption(t("analysis.help_toolbar_edit"))
 
-    canvas_w = max(1, min(largura, 700))
+    canvas_w = max(1, min(largura, CANVAS_MAX_W))
     canvas_h = int(altura * canvas_w / largura)
     escala = largura / canvas_w
 
@@ -1580,93 +2176,215 @@ def ferramenta_zonas(video_path):
     circ_hough = st.session_state.get("zonas_hough_circ")
     init_draw = _circulos_para_canvas(circ_hough, escala) if circ_hough else None
 
-    col_canvas, col_input = st.columns([3, 1])
-    with col_canvas:
-        canvas = st_canvas(
-            fill_color="rgba(255,165,0,0.25)", stroke_width=2, stroke_color="#FFA500",
-            background_image=pil, update_streamlit=True, initial_drawing=init_draw,
-            height=canvas_h, width=canvas_w, drawing_mode=modo, key="canvas_zonas",
-        )
-    with col_input:
-        prefixo = st.text_input("Nome base das áreas", value="Área", key="zonas_prefixo")
-        if st.button("Salvar áreas desenhadas"):
-            objetos = (canvas.json_data or {}).get("objects") if canvas else None
-            poligonos = [p for o in (objetos or [])
-                         if len(p := _poligono_do_objeto(o, escala)) >= 3]
-            if not poligonos:
-                st.error("Desenhe ao menos uma área (polígono ou círculo) antes de salvar.")
-            else:
-                st.session_state["zones"] = [
-                    {"name": f"{prefixo} {i + 1}", "points": p}
-                    for i, p in enumerate(poligonos)
-                ]
-                st.success(f"{len(poligonos)} área(s) salvas.")
-                st.rerun()
+    canvas = st_canvas(
+        fill_color="rgba(255,165,0,0.25)", stroke_width=2, stroke_color="#FFA500",
+        background_image=pil, update_streamlit=True, initial_drawing=init_draw,
+        height=canvas_h, width=canvas_w, drawing_mode=modo, key="canvas_zonas",
+    )
+    col_pref, col_salvar, col_limpar = st.columns([2, 2, 1], vertical_alignment="bottom")
+    with col_pref:
+        prefixo = st.text_input(t("analysis.zone_name_prefix"),
+                                value=t("analysis.zone_name_default"), key="zonas_prefixo")
+    with col_salvar:
+        salvar = st.button(rotulo_salvar, width="stretch")
+    with col_limpar:
+        limpar = st.button(t("analysis.clear_zones"), disabled=not zonas,
+                           width="stretch")
+    if salvar:
+        objetos = (canvas.json_data or {}).get("objects") if canvas else None
+        poligonos = [p for o in (objetos or [])
+                     if len(p := _poligono_do_objeto(o, escala)) >= 3]
+        if not poligonos:
+            st.error(t("analysis.draw_zone_first"))
+        else:
+            st.session_state["zones"] = [
+                {"name": f"{prefixo} {i + 1}", "points": p}
+                for i, p in enumerate(poligonos)
+            ]
+            _sincronizar_nomes_zonas(st.session_state["zones"])
+            ui.flash(t("analysis.zones_saved", n=len(poligonos)))
+            st.rerun()
+    if limpar:
+        st.session_state.pop("zones", None)
+        st.session_state.pop("zonas_hough_circ", None)
+        _sincronizar_nomes_zonas(None)
+        st.rerun()
 
-        st.markdown("---")
-        st.markdown("**Detecção automática (Hough)**")
-        n_placas_auto = st.number_input(
-            "Quantas placas detectar", min_value=1, max_value=30, value=10,
-            key="hough_n",
-            help="Detecta automaticamente os N círculos mais nítidos (placas de "
-                 "Petri) por transformada de Hough e cria uma área para cada um.",
-        )
-        with st.expander("Parâmetros do Hough"):
-            param2 = st.slider(
-                "Sensibilidade (param2)", 10, 100, 30, key="hough_p2",
-                help="Menor = detecta mais círculos (inclui mais falsos); "
-                     "maior = só os mais nítidos.",
-            )
-            raio_min = st.slider("Raio mínimo (% do lado)", 1, 30, 5,
-                                 key="hough_rmin") / 100.0
-            raio_max = st.slider("Raio máximo (% do lado)", 5, 60, 25,
-                                 key="hough_rmax") / 100.0
-        if st.button("🔍 Detectar placas"):
-            circulos = _detectar_placas_hough(
-                frame, int(n_placas_auto), param2, raio_min, raio_max)
-            if not circulos:
-                st.warning("Nenhum círculo detectado. Ajuste os parâmetros do Hough "
-                           "(reduza a sensibilidade ou ajuste a faixa de raios).")
-            else:
-                # Injeta no canvas para ajuste; o usuário corrige e clica em Salvar.
-                st.session_state["zonas_hough_circ"] = circulos
-                st.session_state["zona_forcar_ajuste"] = True  # já entra no modo ajustar
-                st.success(f"{len(circulos)} placa(s) detectada(s) — ajuste no canvas "
-                           "(modo *Ajustar* move/exclui) e clique em *Salvar áreas*.")
-                st.rerun()
-
-    zonas = st.session_state.get("zones") or []
     if zonas:
         # O canvas acima já mostra as áreas sobre o frame — não repetir o preview.
-        st.caption(f"**{len(zonas)} área(s) definidas.** Renomeie abaixo se quiser:")
-        st.caption("Nomes das áreas:")
-        cols_nomes = st.columns(5)
-        for i, z in enumerate(zonas):
-            z["name"] = cols_nomes[i % 5].text_input(
-                f"Área {i + 1}", value=z["name"], key=f"zona_nome_{i}")
-        if st.button("Limpar áreas"):
-            st.session_state.pop("zones", None)
-            st.session_state.pop("zonas_hough_circ", None)
-            st.rerun()
+        st.caption(t("analysis.zones_defined_rename", n=len(zonas)))
+        for ini in range(0, len(zonas), 3):   # no máximo 3 por linha
+            cols_nomes = st.columns(3)
+            for j, z in enumerate(zonas[ini:ini + 3]):
+                i = ini + j
+                chave = f"zona_nome_{i}"
+                # Com o nome já na sessão (_sincronizar_nomes_zonas), não passa
+                # `value=`: o Streamlit avisaria do valor duplicado.
+                inicial = {} if chave in st.session_state else {"value": z["name"]}
+                z["name"] = cols_nomes[j].text_input(
+                    t("analysis.zone_n", n=i + 1), key=chave, **inicial)
     else:
-        st.caption("Nenhuma área definida — o relatório terá apenas dados globais.")
+        st.caption(t("analysis.no_zones_global"))
+
+
+def _descartar_video_atual():
+    """Apaga o vídeo enviado (arquivo temporário) e o seu estado na sessão."""
+    caminho = st.session_state.pop("video_path", None)
+    for k in ("video_token", "video_nome", "video_tamanho", "_keep_trecho"):
+        st.session_state.pop(k, None)
+    if caminho and os.path.exists(caminho):
+        try:
+            os.remove(caminho)
+        except OSError:
+            pass
+
+
+def _ao_mudar_upload():
+    # O usuário removeu o arquivo no próprio uploader (botão ✕). Trocar de tela
+    # também esvazia o widget, mas NÃO dispara este callback — por isso o vídeo
+    # continua disponível quando a pessoa volta para Nova Análise.
+    if st.session_state.get("video_upload") is None:
+        _descartar_video_atual()
+
+
+def _limite_upload():
+    """Tamanho máximo de upload configurado no servidor, legível ('3 GB')."""
+    try:
+        mb = float(st.get_option("server.maxUploadSize") or 200)
+    except Exception:
+        mb = 200.0
+    return f"{mb / 1000:g} GB" if mb >= 1000 else f"{mb:g} MB"
+
+
+def _onboarding_nova_analise():
+    """Estado vazio (antes do upload): o fluxo em 4 passos + dicas de gravação."""
+    passos = [
+        ("📤", t("analysis.onb_upload_title"), t("analysis.onb_upload")),
+        ("✂️", t("analysis.onb_trim_title"), t("analysis.onb_trim")),
+        ("📏", t("analysis.onb_prepare_title"), t("analysis.onb_prepare")),
+        ("▶️", t("analysis.onb_process_title"), t("analysis.onb_process")),
+    ]
+    for i, (col, (icone, titulo, texto)) in enumerate(zip(st.columns(4), passos), 1):
+        with col, st.container(border=True):
+            st.markdown(f"**{i} · {icone} {titulo}**")
+            st.caption(texto)
+    st.caption(t("analysis.onb_tips", max=_limite_upload(),
+                 history=t("sidebar.tab_my_analyses")))
+
+
+def _secao(titulo):
+    """Seção numerada da Nova Análise (contêiner com borda + título)."""
+    caixa = st.container(border=True)
+    caixa.markdown(f"##### {titulo}")
+    return caixa
+
+
+def _chips_preparo():
+    """Chips de estado da preparação: escala e áreas."""
+    escala = st.session_state.get("pixels_per_mm", 0.0) or 0.0
+    n_zonas = len(st.session_state.get("zones") or [])
+    chips = [
+        ui.chip(t("analysis.chip_scale", scale=escala), "ok") if escala > 0
+        else ui.chip(t("analysis.chip_no_scale"), "warn"),
+        ui.chip(t("analysis.chip_zones", n=n_zonas), "ok") if n_zonas
+        else ui.chip(t("analysis.chip_no_zones"), "warn"),
+    ]
+    st.markdown(" ".join(chips), unsafe_allow_html=True)
+
+
+def _resumo_parametros(nome_modelo, frame_skip, conf, n_amostras, num_placas,
+                       ampliar_areas, gerar_video, coletar_candidatos, limiar_revisao):
+    """Resumo (somente leitura) do que será usado no processamento."""
+    zonas = st.session_state.get("zones") or []
+    escala = st.session_state.get("pixels_per_mm", 0.0) or 0.0
+    sim, nao = t("analysis.sum_on"), t("analysis.sum_off")
+    amostragem = t("analysis.sum_sampling_value", skip=frame_skip)
+    if n_amostras:
+        amostragem += " " + t("analysis.sum_sampling_est", n=n_amostras)
+    alvos = (t("analysis.sum_areas_value", n=len(zonas)) if zonas
+             else t("analysis.sum_dishes_value", n=num_placas))
+    recorte = (sim if ampliar_areas else nao) if zonas else t("analysis.sum_crop_no_areas")
+    candidatos = (t("analysis.sum_candidates_value", thr=limiar_revisao)
+                  if coletar_candidatos else nao)
+    itens = [
+        (t("analysis.sum_model"), f"`{nome_modelo}`" if nome_modelo else "—"),
+        (t("analysis.sum_sampling"), amostragem),
+        (t("sidebar.conf_threshold"), f"{conf:.2f}"),
+        (t("analysis.sum_targets"), alvos),
+        (t("analysis.sum_scale"), (f"{escala:.2f} px/mm" if escala > 0
+                                   else t("analysis.chip_no_scale"))),
+        (t("analysis.sum_crop"), recorte),
+        (t("analysis.sum_review_video"), sim if gerar_video else nao),
+        (t("analysis.sum_candidates"), candidatos),
+    ]
+    metade = (len(itens) + 1) // 2
+    for col, parte in zip(st.columns(2), (itens[:metade], itens[metade:])):
+        col.markdown("\n".join(f"- {rot}: **{val}**" for rot, val in parte))
+    if zonas:
+        st.caption(t("analysis.zones_as_dishes", n=len(zonas)))
+    st.caption(t("analysis.settings_hint", settings=t("sidebar.settings")))
+
+
+def _cartao_pos_execucao(resumo):
+    """Cartão com o resumo da última execução e atalhos para as outras telas."""
+    with st.container(border=True):
+        st.markdown(t("analysis.run_card_title", id=resumo["id"]))
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric(t("analysis.run_card_analysis"), f"#{resumo['id']}")
+        c2.metric(t("analysis.run_card_detections"), resumo["detections"])
+        c3.metric(t("analysis.run_card_dishes"), resumo["dishes"])
+        c4.metric(t("analysis.run_card_time"), _fmt_duracao(resumo["secs"]))
+        st.caption(t("analysis.run_card_below"))
+        botoes = [("history", t("analysis.go_results"),
+                   t("analysis.go_results_help", id=resumo["id"],
+                     history=t("sidebar.tab_my_analyses")))]
+        if resumo.get("video"):
+            botoes.append(("review", t("analysis.go_review"), None))
+        if resumo.get("candidates"):
+            botoes.append(("annotate", t("analysis.go_annotate", n=resumo["candidates"]),
+                           None))
+        for col, (destino, rotulo, ajuda) in zip(st.columns(3), botoes):
+            if col.button(rotulo, key=f"pos_run_{destino}", help=ajuda, width="stretch",
+                          type="primary" if destino == "history" else "secondary"):
+                if destino == "history":
+                    # Abre o histórico já com esta análise selecionada.
+                    st.session_state["_keep_hist_analise"] = resumo["id"]
+                    st.session_state.pop("hist_analise_sel", None)
+                go_to(destino)
 
 
 def render_nova_analise(user_id, model, backend, class_names,
                         frame_skip, input_size, conf, nms, limiar_parada_px,
                         num_placas=1, ampliar_areas=False, gerar_video=False,
-                        coletar_candidatos=False, limiar_revisao=0.5):
+                        coletar_candidatos=False, limiar_revisao=0.5,
+                        nome_modelo=None):
     st.session_state.setdefault("pixels_per_mm", 0.0)
-    uploaded = st.file_uploader(
-        "Escolha um arquivo de vídeo (.mp4, .avi, .mov)", type=["mp4", "avi", "mov"]
-    )
+    # O passo a passo fica acima do envio, mas só se sabe se há vídeo depois
+    # de desenhar o uploader — por isso um contêiner reservado.
+    topo = st.container()
+
+    # ===== 1 · Vídeo e trecho =====
+    sec_video = _secao(t("analysis.section_video"))
+    with sec_video:
+        uploaded = st.file_uploader(
+            t("analysis.upload_video"), type=["mp4", "avi", "mov"],
+            key="video_upload", on_change=_ao_mudar_upload,
+        )
+    caminho_salvo = st.session_state.get("video_path")
     if uploaded is None:
-        st.info("Aguardando o upload do vídeo...")
-        return
+        # Widgets de telas não exibidas perdem o estado: o uploader volta vazio
+        # ao retornar a esta tela, mas o vídeo enviado continua em disco.
+        if caminho_salvo and os.path.exists(caminho_salvo):
+            sec_video.caption(t("analysis.video_kept",
+                                name=st.session_state.get("video_nome", "")))
+        else:
+            with topo:
+                _onboarding_nova_analise()
+            return
 
     # Salva o upload em disco por streaming, uma única vez por arquivo
-    token = (uploaded.name, uploaded.size)
-    if st.session_state.get("video_token") != token:
+    token = (uploaded.name, uploaded.size) if uploaded is not None else None
+    if token is not None and st.session_state.get("video_token") != token:
         caminho_antigo = st.session_state.pop("video_path", None)
         if caminho_antigo and os.path.exists(caminho_antigo):
             try:
@@ -1679,104 +2397,193 @@ def render_nova_analise(user_id, model, backend, class_names,
             shutil.copyfileobj(uploaded, tmp, length=8 * 1024 * 1024)
         st.session_state["video_path"] = tmp.name
         st.session_state["video_token"] = token
+        st.session_state["video_nome"] = uploaded.name
+        st.session_state["video_tamanho"] = uploaded.size
+        st.session_state.pop("_keep_trecho", None)
         st.session_state.pop("resultado", None)
+        st.session_state.pop("resultado_resumo", None)
         log_event("video_uploaded", f"Upload de '{uploaded.name}'",
                   user_id=user_id, tamanho_bytes=uploaded.size)
 
     video_path = st.session_state["video_path"]
-    # Altura/centralização do vídeo agora vêm do CSS global (ui.py).
-    st.video(video_path)
+    video_nome = st.session_state.get("video_nome") or os.path.basename(video_path)
+    video_tamanho = st.session_state.get("video_tamanho") or os.path.getsize(video_path)
+    trecho_ok = True
+    n_amostras = None
+    with sec_video:
+        # Altura/centralização do vídeo agora vêm do CSS global (ui.py).
+        st.video(video_path)
 
-    # Trecho do vídeo a analisar (início e fim em hh:mm:ss)
-    dur = _duracao_video(video_path)
-    if dur and dur >= 1:
-        t_min, t_max = dtime(0, 0, 0), _seg_para_time(int(dur))
-        ini_t, fim_t = st.slider(
-            "Trecho a analisar (hh:mm:ss)", min_value=t_min, max_value=t_max,
-            value=(t_min, t_max), step=dtimedelta(seconds=1), format="HH:mm:ss",
-            help="Defina o início e o fim. Só esse trecho do vídeo será "
-                 "processado — útil para ignorar manuseio no começo/fim.",
-        )
-        inicio_s = float(_time_para_seg(ini_t))
-        # Mantendo o fim no máximo, processa até o fim real do vídeo.
-        fim_s = None if fim_t == t_max else float(_time_para_seg(fim_t))
-        fim_efetivo = dur if fim_s is None else fim_s
-        if fim_efetivo <= inicio_s:
-            st.warning("O fim deve ser maior que o início.")
-        st.caption(f"Analisando de **{_fmt_hms(inicio_s)}** a "
-                   f"**{_fmt_hms(fim_efetivo)}** (de {_fmt_hms(dur)} totais).")
-    else:
-        inicio_s, fim_s = 0.0, None
+        # Trecho do vídeo a analisar (início e fim em hh:mm:ss)
+        dur = _duracao_video(video_path)
+        if dur and dur >= 1:
+            t_min, t_max = dtime(0, 0, 0), _seg_para_time(int(dur))
+            # O trecho fica numa chave comum (não de widget) para sobreviver à troca
+            # de tela; o widget é recriado a partir dela.
+            trecho = st.session_state.get("_keep_trecho")
+            if not (trecho and trecho[0] == video_path
+                    and t_min <= trecho[1][0] <= trecho[1][1] <= t_max):
+                trecho = (video_path, (t_min, t_max))
+                # Vídeo novo: o slider (com key) ignoraria `value=` e manteria o
+                # trecho do vídeo anterior quando as durações coincidem.
+                if st.session_state.get("trecho_video", trecho[1]) != trecho[1]:
+                    st.session_state["trecho_video"] = trecho[1]
+            ini_t, fim_t = st.slider(
+                t("analysis.segment"), min_value=t_min, max_value=t_max,
+                value=trecho[1], step=dtimedelta(seconds=1), format="HH:mm:ss",
+                help=t("analysis.segment_help"), key="trecho_video",
+            )
+            st.session_state["_keep_trecho"] = (video_path, (ini_t, fim_t))
+            inicio_s = float(_time_para_seg(ini_t))
+            # Mantendo o fim no máximo, processa até o fim real do vídeo.
+            fim_s = None if fim_t == t_max else float(_time_para_seg(fim_t))
+            fim_efetivo = dur if fim_s is None else fim_s
+            if fim_efetivo <= inicio_s:
+                trecho_ok = False
+                st.warning(t("analysis.end_before_start"))
+            else:
+                fps_v = _fps_video(video_path)
+                if fps_v > 0:
+                    n_amostras = max(1, int(np.ceil(
+                        (fim_efetivo - inicio_s) * fps_v / max(1, frame_skip))))
+            resumo_trecho = t("analysis.segment_summary", start=_fmt_hms(inicio_s),
+                              end=_fmt_hms(fim_efetivo), total=_fmt_hms(dur))
+            if n_amostras:
+                resumo_trecho += " " + t("analysis.segment_estimate",
+                                         n=n_amostras, skip=frame_skip)
+            st.caption(resumo_trecho)
+        else:
+            inicio_s, fim_s = 0.0, None
 
+    # ===== 2 · Preparação (opcional) =====
     # Ferramentas de desenho (escala/áreas): apenas UMA fica ativa por vez.
     # Dois st_canvas na mesma página conflitam e às vezes não renderizam.
-    st.markdown("#### Preparação (opcional)")
-    escala_atual = st.session_state.get("pixels_per_mm", 0.0)
-    zonas_atuais = st.session_state.get("zones") or []
-    st.caption(
-        f"Escala: **{('%.2f px/mm' % escala_atual) if escala_atual > 0 else '—'}** · "
-        f"Áreas definidas: **{len(zonas_atuais)}**"
-    )
-    ferramenta = st.radio(
-        "Ferramenta de desenho",
-        ["Nenhuma", "📏 Calibrar escala (px → mm)", "🎯 Definir áreas de monitoramento"],
-        horizontal=True, key="ferramenta_desenho",
-        help="Só uma ferramenta de desenho fica ativa por vez — isso evita o "
-             "conflito que fazia o canvas não abrir em algumas vezes.",
-    )
-    if ferramenta.startswith("📏"):
-        ferramenta_calibracao(video_path)
-    elif ferramenta.startswith("🎯"):
-        ferramenta_zonas(video_path)
+    with _secao(t("analysis.section_prep")):
+        _chips_preparo()
+        _ferramentas = {
+            "none": t("analysis.tool_none"),
+            "scale": t("analysis.tool_scale"),
+            "zones": t("analysis.tool_zones"),
+        }
+        if st.session_state.get("ferramenta_desenho") not in (None, *_ferramentas):
+            st.session_state.pop("ferramenta_desenho", None)  # valor antigo (rótulo)
+        _ult_ferr = st.session_state.get("_keep_ferramenta", "none")
+        ferramenta = st.segmented_control(
+            t("analysis.tool"), list(_ferramentas), format_func=_ferramentas.get,
+            key="ferramenta_desenho", required=True,
+            default=_ult_ferr if _ult_ferr in _ferramentas else "none",
+            help=t("analysis.tool_help"),
+        )
+        if ferramenta not in _ferramentas:
+            ferramenta = "none"
+        st.session_state["_keep_ferramenta"] = ferramenta
+        if ferramenta == "scale":
+            ferramenta_calibracao(video_path)
+        elif ferramenta == "zones":
+            ferramenta_zonas(video_path)
 
-    if st.button("Processar Vídeo", type="primary"):
-        zonas = st.session_state.get("zones") or []
-        params = dict(frame_skip=frame_skip, input_size=input_size,
-                      conf=conf, nms=nms, backend=backend,
-                      pixels_per_mm=st.session_state.get("pixels_per_mm", 0.0) or None,
-                      zones=json.dumps(zonas) if zonas else None)
-        # Com áreas definidas, cada área é uma placa: o nº de abelhas = nº de áreas.
-        n_alvos = len(zonas) if zonas else num_placas
-        usar_ampliacao = bool(zonas) and ampliar_areas
-        if zonas:
-            msg = (f"{len(zonas)} área(s) definida(s): cada área será tratada como "
-                   "uma placa. Detecções fora das áreas são descartadas.")
-            if usar_ampliacao:
-                msg += " Detecção ampliada por área **ativada**."
-            st.info(msg)
-        elif ampliar_areas:
-            st.warning("Detecção ampliada por área ignorada: nenhuma área definida.")
-        log_params = {k: v for k, v in params.items() if k != "zones"}
-        log_event("analysis_started", f"Iniciando análise de '{uploaded.name}'",
-                  user_id=user_id, num_placas=n_alvos, usa_zonas=bool(zonas),
-                  **log_params)
+    # ===== 3 · Processar =====
+    with _secao(t("analysis.section_process")):
+        _resumo_parametros(nome_modelo, frame_skip, conf, n_amostras, num_placas,
+                           ampliar_areas, gerar_video, coletar_candidatos,
+                           limiar_revisao)
+        falha = st.session_state.pop("_analise_falha", None)
+        if falha:
+            st.error(falha)
+        processar = st.button(
+            t("analysis.process_video"), type="primary", disabled=not trecho_ok,
+            help=None if trecho_ok else t("analysis.process_disabled_help"),
+            on_click=_marcar_ocupado,
+        )
+        st.caption(t("analysis.keep_page_open"))
+        if processar:
+            with _tarefa_longa():
+                _executar_analise(user_id, model, backend, class_names, frame_skip,
+                                  input_size, conf, nms, num_placas, ampliar_areas,
+                                  gerar_video, coletar_candidatos, limiar_revisao,
+                                  video_path, video_nome, video_tamanho, inicio_s,
+                                  fim_s)
+
+    resultado = st.session_state.get("resultado")
+    if resultado is not None and resultado.primeiro_frame is not None:
+        resumo = st.session_state.get("resultado_resumo")
+        if resumo:
+            _cartao_pos_execucao(resumo)
+        exibir_resultados(
+            resultado, st.session_state.get("resultado_frame_skip", frame_skip),
+            limiar_parada_px,
+            pixels_per_mm=st.session_state.get("resultado_pixels_per_mm"),
+            zones=st.session_state.get("resultado_zones"),
+            conf=st.session_state.get("resultado_conf", conf),
+        )
+
+
+def _executar_analise(user_id, model, backend, class_names, frame_skip, input_size,
+                      conf, nms, num_placas, ampliar_areas, gerar_video,
+                      coletar_candidatos, limiar_revisao, video_path, video_nome,
+                      video_tamanho, inicio_s, fim_s):
+    """Roda o processamento dentro de um st.status com as etapas e salva a análise."""
+    zonas = st.session_state.get("zones") or []
+    params = dict(frame_skip=frame_skip, input_size=input_size,
+                  conf=conf, nms=nms, backend=backend,
+                  pixels_per_mm=st.session_state.get("pixels_per_mm", 0.0) or None,
+                  zones=json.dumps(zonas) if zonas else None)
+    # Com áreas definidas, cada área é uma placa: o nº de abelhas = nº de áreas.
+    n_alvos = len(zonas) if zonas else num_placas
+    usar_ampliacao = bool(zonas) and ampliar_areas
+    log_params = {k: v for k, v in params.items() if k != "zones"}
+    log_event("analysis_started", f"Iniciando análise de '{video_nome}'",
+              user_id=user_id, num_placas=n_alvos, usa_zonas=bool(zonas),
+              **log_params)
+    t0 = time.perf_counter()
+    with st.status(t("analysis.processing", skip=frame_skip, n=n_alvos),
+                   expanded=True) as caixa:
+        def _fase(msg):
+            caixa.update(label=msg)
+            st.write(msg)
+
         try:
-            with st.spinner(f"Processando vídeo (1 a cada {frame_skip} frames, "
-                            f"{n_alvos} placa(s))..."):
-                resultado = processar_video(
-                    video_path, model, class_names, frame_skip, conf, nms,
-                    num_alvos=num_placas, zones=zonas or None,
-                    ampliar_areas=usar_ampliacao, gerar_video=gerar_video,
-                    inicio_s=inicio_s, fim_s=fim_s,
-                    coletar_candidatos=coletar_candidatos, limiar_revisao=limiar_revisao,
-                )
+            resultado = processar_video(
+                video_path, model, class_names, frame_skip, conf, nms,
+                num_alvos=num_placas, zones=zonas or None,
+                ampliar_areas=usar_ampliacao, gerar_video=gerar_video,
+                inicio_s=inicio_s, fim_s=fim_s,
+                coletar_candidatos=coletar_candidatos, limiar_revisao=limiar_revisao,
+                fase=_fase,
+            )
         except Exception as e:
-            log_event("analysis_failed", f"Erro ao processar '{uploaded.name}': {e}",
+            log_event("analysis_failed", f"Erro ao processar '{video_nome}': {e}",
                       user_id=user_id, level=logging.ERROR)
-            st.error(f"Erro durante o processamento: {e}")
+            caixa.update(label=t("analysis.status_failed"), state="error")
+            # A página é redesenhada ao fim (_tarefa_longa): a mensagem vai
+            # para a sessão para continuar visível.
+            st.session_state["_analise_falha"] = t("analysis.processing_error", error=e)
             return
+        except BaseException:
+            # Execução interrompida pelo Streamlit (aba fechada, barra lateral
+            # alterada...): nada foi salvo; registra e deixa a interrupção seguir.
+            log_event("analysis_interrupted",
+                      f"Análise de '{video_nome}' interrompida antes de salvar",
+                      user_id=user_id, level=logging.WARNING)
+            raise
 
         if resultado is None or resultado.primeiro_frame is None:
-            st.error("Não foi possível ler nenhum frame do vídeo.")
+            caixa.update(label=t("analysis.status_failed"), state="error")
+            st.session_state["_analise_falha"] = (
+                t("core.video_open_error") if resultado is None
+                else t("analysis.no_frames"))
             return
 
+        _fase(t("analysis.phase_saving"))
         analysis_id = salvar_analise(
-            user_id, uploaded.name, uploaded.size, params, resultado
+            user_id, video_nome, video_tamanho, params, resultado
         )
+        st.write(t("analysis.phase_saved", id=analysis_id))
         st.session_state["resultado"] = resultado
         st.session_state["resultado_frame_skip"] = frame_skip
         st.session_state["resultado_pixels_per_mm"] = params["pixels_per_mm"]
         st.session_state["resultado_zones"] = zonas
+        st.session_state["resultado_conf"] = conf
         # Vídeo de conferência: remove o anterior e guarda o novo caminho.
         antigo_video = st.session_state.pop("video_deteccoes", None)
         if antigo_video and os.path.exists(antigo_video):
@@ -1785,61 +2592,79 @@ def render_nova_analise(user_id, model, backend, class_names,
             except OSError:
                 pass
         st.session_state["video_deteccoes"] = resultado.video_deteccoes
-        st.session_state["video_deteccoes_nome"] = uploaded.name
-        msg_extra = (" Vídeo de conferência disponível na aba '🎬 Conferência'."
-                     if resultado.video_deteccoes else "")
+        st.session_state["video_deteccoes_nome"] = video_nome
         # Salva os candidatos para reanotação (se coletados).
         n_cand = 0
         for cand in (resultado.candidatos or []):
             database.add_candidate(
-                user_id, analysis_id, uploaded.name, cand["frame_index"],
+                user_id, analysis_id, video_nome, cand["frame_index"],
                 cand["reason"], cand["pred_conf"], cand["pred_boxes"],
                 cand["width"], cand["height"], cand["image_jpg"],
                 area=cand.get("area"))
             n_cand += 1
         if n_cand:
-            msg_extra += (f" {n_cand} candidato(s) coletado(s) para reanotação "
-                          "na aba '🏷️ Anotação'.")
-            log_event("candidates_collected", f"{n_cand} candidatos de '{uploaded.name}'",
+            st.write(t("analysis.phase_candidates", n=n_cand))
+            log_event("candidates_collected", f"{n_cand} candidatos de '{video_nome}'",
                       user_id=user_id, analysis_id=analysis_id)
-        st.success(f"Processamento concluído! Análise salva como **#{analysis_id}** "
-                   "— disponível na aba 'Minhas Análises'." + msg_extra)
+        decorrido = time.perf_counter() - t0
+        caixa.update(label=t("analysis.status_done", id=analysis_id,
+                             time=_fmt_duracao(decorrido)),
+                     state="complete", expanded=False)
 
-    resultado = st.session_state.get("resultado")
-    if resultado is not None and resultado.primeiro_frame is not None:
-        exibir_resultados(
-            resultado, st.session_state.get("resultado_frame_skip", frame_skip),
-            limiar_parada_px,
-            pixels_per_mm=st.session_state.get("resultado_pixels_per_mm"),
-            zones=st.session_state.get("resultado_zones"),
-        )
+    st.session_state["resultado_resumo"] = {
+        "id": analysis_id, "detections": int(len(resultado.centroides)),
+        "dishes": int(resultado.num_alvos), "secs": decorrido,
+        "video": bool(resultado.video_deteccoes), "candidates": n_cand,
+    }
+    # Toast via flash: a página é redesenhada logo depois (_tarefa_longa).
+    ui.flash(t("analysis.toast_saved", id=analysis_id))
+    if class_names and TARGET_CLASS not in class_names:
+        ui.flash(t("core.class_not_found", cls=TARGET_CLASS, names=YOLO_NAMES), "warning")
 
 
 def render_conferencia():
     """Aba de conferência: reproduz o vídeo anotado das detecções do último
     processamento, para o usuário verificar e ajustar os parâmetros."""
-    st.markdown("### 🎬 Conferência das detecções")
-    st.caption("Vídeo montado a partir dos frames processados, com as detecções "
-               "desenhadas — útil para verificar pontos importantes e ajustar os "
-               "parâmetros (confiança, NMS, áreas, ampliação).")
+    st.markdown(t("analysis.review_title"))
+    st.caption(t("analysis.review_caption"))
     path = st.session_state.get("video_deteccoes")
     if not path or not os.path.exists(path):
-        st.info("Nenhum vídeo de conferência disponível ainda. Marque **'Gerar "
-                "vídeo de conferência das detecções'** na barra lateral (seção "
-                "*Detecção*) e processe um vídeo na aba *Nova Análise*.")
+        # Estado vazio: como gerar o vídeo (rótulos exatos da barra lateral).
+        with st.container(border=True):
+            st.markdown(t("analysis.review_empty_title"))
+            st.markdown(t("analysis.review_empty_steps",
+                          settings=t("sidebar.settings"),
+                          section=t("sidebar.detection"),
+                          option=t("sidebar.review_video"),
+                          new=t("sidebar.tab_new_analysis")))
+            if st.session_state.get("cfg_gerar_video") is False:
+                st.warning(t("analysis.review_option_off", option=t("sidebar.review_video")))
+            st.caption(t("analysis.review_empty_note"))
+            if st.button(t("analysis.go_new"), type="primary",
+                         key="conf_ir_nova"):
+                go_to("new")
         return
     nome = st.session_state.get("video_deteccoes_nome")
     if nome:
-        st.caption(f"Origem: **{nome}**")
-    st.markdown("**Legenda:** 🟧 áreas · 🟨 detecções brutas do YOLO (com confiança) "
-                "· 🟩 detecção aceita / rastreada")
+        st.caption(t("analysis.review_source", name=_md_esc(nome)))
+    st.markdown(
+        f"<div style='display:flex;flex-wrap:wrap;gap:6px;align-items:center;"
+        f"margin:2px 0 8px'>"
+        f"<span style='font-size:.85rem;opacity:.8'>{ui.esc(t('analysis.review_legend_title'))}</span>"
+        f"{ui.chip(ui.esc(t('analysis.review_legend_areas')), 'warn')}"
+        f"{ui.chip(ui.esc(t('analysis.review_legend_raw')), 'raw')}"
+        f"{ui.chip(ui.esc(t('analysis.review_legend_accepted')), 'ok')}</div>",
+        unsafe_allow_html=True)
     st.video(path)
+    aid = (st.session_state.get("resultado_resumo") or {}).get("id")
+    nome_arq = (t("analysis.review_file", id=aid) if aid is not None
+                else t("analysis.review_file_noid"))
     try:
         with open(path, "rb") as fh:
-            st.download_button("⬇️ Baixar vídeo de conferência", data=fh.read(),
-                               file_name="conferencia_deteccoes.mp4", mime="video/mp4")
+            st.download_button(t("analysis.review_download"), data=fh.read(),
+                               file_name=nome_arq, mime="video/mp4", on_click="ignore")
     except OSError:
-        st.warning("Não foi possível ler o arquivo de vídeo de conferência.")
+        st.warning(t("analysis.review_unreadable"))
 
 
 def _box_para_rect_canvas(box, escala):
@@ -1884,13 +2709,17 @@ def importar_dataset_zip(conteudo_bytes):
     """Importa um .zip no formato YOLO (imagens + labels) para o dataset externo.
 
     Aceita qualquer layout: separa por extensão (imagens vs .txt) pelo nome do
-    arquivo. Mescla com o que já foi importado. Devolve (n_imgs, n_labels) novos.
+    arquivo. Mescla com o que já foi importado. Devolve um dict com o que veio
+    no .zip: imagens, rotulos, com_rotulo (imagens com .txt de mesmo nome),
+    sem_rotulo (imagens sem .txt: entram no treino como imagens sem abelha) e
+    rotulos_orfaos (.txt sem imagem: não são usados).
     """
     import io as _io
     import zipfile
     img_dir, lbl_dir = _externo_img_dir(), _externo_lbl_dir()
     img_dir.mkdir(parents=True, exist_ok=True)
     lbl_dir.mkdir(parents=True, exist_ok=True)
+    stems_img, stems_lbl = set(), set()
     n_i = n_l = 0
     with zipfile.ZipFile(_io.BytesIO(conteudo_bytes)) as zf:
         for info in zf.infolist():
@@ -1899,16 +2728,22 @@ def importar_dataset_zip(conteudo_bytes):
             nome = os.path.basename(info.filename)
             if not nome or nome.startswith("."):
                 continue
-            ext = os.path.splitext(nome)[1].lower()
+            stem, ext = os.path.splitext(nome)
+            ext = ext.lower()
             if ext in _IMG_EXTS:
                 with zf.open(info) as src, open(img_dir / nome, "wb") as dst:
                     shutil.copyfileobj(src, dst)
                 n_i += 1
+                stems_img.add(stem)
             elif ext == ".txt" and nome.lower() not in ("classes.txt", "readme.txt"):
                 with zf.open(info) as src, open(lbl_dir / nome, "wb") as dst:
                     shutil.copyfileobj(src, dst)
                 n_l += 1
-    return n_i, n_l
+                stems_lbl.add(stem)
+    return {"imagens": n_i, "rotulos": n_l,
+            "com_rotulo": len(stems_img & stems_lbl),
+            "sem_rotulo": len(stems_img - stems_lbl),
+            "rotulos_orfaos": len(stems_lbl - stems_img)}
 
 
 def limpar_externo():
@@ -2022,9 +2857,11 @@ def importar_modelo_upload(arquivos):
         nome = os.path.basename(f.name)
         ext = os.path.splitext(nome)[1].lower()
         if ext not in (".pt", ".weights", ".cfg"):
-            erros.append(f"{nome}: extensão não suportada (use .pt, .weights ou .cfg).")
+            erros.append(t("model.err_unsupported_ext", name=nome))
             continue
         destino = _TRAINED_DIR / nome
+        if destino.exists() and destino not in gravados:
+            erros.append(t("model.replaced_existing", name=nome))
         with open(destino, "wb") as out:
             out.write(f.getbuffer())
         gravados.append(destino)
@@ -2041,7 +2878,7 @@ def importar_modelo_upload(arquivos):
             except Exception as e:
                 p.unlink(missing_ok=True)
                 msg = (str(e).strip().splitlines() or [repr(e)])[-1][:90]
-                erros.append(f"{p.name}: .pt inválido ({msg}). Removido.")
+                erros.append(t("model.err_invalid_pt", name=p.name, msg=msg))
         elif ext == ".weights":
             cfg_par = p.with_suffix(".cfg")
             cfg = str(cfg_par) if cfg_par.exists() else YOLO_CFG
@@ -2051,30 +2888,84 @@ def importar_modelo_upload(arquivos):
             except Exception as e:
                 msg = (str(e).strip().splitlines() or [repr(e)])[-1][:90]
                 if not cfg_par.exists():
-                    erros.append(f"{p.name}: enviado, mas precisa do .cfg "
-                                 f"correspondente (envie {p.stem}.cfg).")
+                    erros.append(t("model.err_missing_cfg", name=p.name, stem=p.stem))
                     salvos.append(p.name)  # mantém; falta só o cfg
                 else:
                     p.unlink(missing_ok=True)
-                    erros.append(f"{p.name}: Darknet inválido ({msg}). Removido.")
+                    erros.append(t("model.err_invalid_darknet", name=p.name, msg=msg))
     return salvos, erros
 
 
-def treinar_modelo(user_id, base_model, epochs, imgsz, barra, status):
+class SemImagensParaTreino(RuntimeError):
+    """Nenhuma imagem rotulada utilizável para montar o dataset de treino."""
+
+
+# Perfis de treino (Anotação > Treinar): modelo base, épocas e resolução.
+PERFIS_TREINO = {
+    "fast": {"base": "yolo11n.pt", "epochs": 30, "imgsz": 416},
+    "balanced": {"base": "yolo11n.pt", "epochs": 100, "imgsz": 640},
+    "accurate": {"base": "yolo11s.pt", "epochs": 200, "imgsz": 640},
+}
+MODELOS_BASE = ["yolo11n.pt", "yolo11s.pt", "yolov8n.pt", "yolov8s.pt"]
+
+
+def dispositivo_treino() -> tuple[str, str]:
+    """("gpu", nome da placa) se o PyTorch vê CUDA, senão ("cpu", "")."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            try:
+                return "gpu", torch.cuda.get_device_name(0)
+            except Exception:
+                return "gpu", ""
+    except Exception:
+        pass
+    return "cpu", ""
+
+
+def erro_treino_amigavel(e: BaseException) -> str:
+    """Classifica uma falha de treino: "offline", "no_images", "oom" ou "other"."""
+    if isinstance(e, SemImagensParaTreino):
+        return "no_images"
+    txt = f"{type(e).__name__}: {e}".lower()
+    if isinstance(e, MemoryError) or any(k in txt for k in (
+            "out of memory", "cannot allocate memory", "defaultcpuallocator",
+            "not enough memory", "std::bad_alloc")):
+        return "oom"
+    if any(k in txt for k in (
+            "urlopen", "connectionerror", "connection error", "name resolution",
+            "name or service not known", "network is unreachable", "getaddrinfo",
+            "max retries exceeded", "failed to download", "download failure",
+            "httpsconnection", "timed out", "temporary failure")):
+        return "offline"
+    if any(k in txt for k in ("no images found", "no labels found",
+                              "images not found", "dataset images not found")):
+        return "no_images"
+    return "other"
+
+
+def treinar_modelo(user_id, base_model, epochs, imgsz, barra, status=None):
     """Fine-tuning Ultralytics a partir dos candidatos anotados do usuário.
 
     Monta o dataset YOLO em disco (candidatos + dataset externo importado),
     treina (GPU se disponível) e salva o melhor `.pt` em _TRAINED_DIR (volume de
     dados, persistente). Devolve (caminho_pt, n_imagens, n_caixas).
+    `barra` é um st.progress (o texto mostra época, tempo e estimativa);
+    `status`, se dado, é um st.empty que recebe o mesmo texto.
     """
     from ultralytics import YOLO
     import torch
 
     anotados = database.list_annotated_candidates(user_id)
+    n_ext = contar_externo()[0]
+    if not anotados and n_ext == 0:
+        raise SemImagensParaTreino("no annotated images")
     tmp = tempfile.mkdtemp(prefix="bee_ds_")
-    extra = [str(_externo_img_dir())] if contar_externo()[0] > 0 else None
+    extra = [str(_externo_img_dir())] if n_ext > 0 else None
     data_yaml, n_imgs, n_caixas = dataset.export_to_dir(anotados, tmp,
                                                         extra_train_dirs=extra)
+    if n_imgs + n_ext == 0:
+        raise SemImagensParaTreino("no annotated images")
 
     device = 0 if torch.cuda.is_available() else "cpu"
     _TRAINED_DIR.mkdir(parents=True, exist_ok=True)
@@ -2082,12 +2973,19 @@ def treinar_modelo(user_id, base_model, epochs, imgsz, barra, status):
     nome_run = datetime.now().strftime("ft_%Y%m%d_%H%M%S")
 
     modelo = YOLO(base_model)
+    inicio = time.time()
 
     def _cb(trainer):
         ep = int(getattr(trainer, "epoch", 0)) + 1
+        total = max(int(epochs), 1)
+        decorrido = time.time() - inicio
+        restante = decorrido / ep * max(total - ep, 0)
+        texto = t("model.train_epoch_progress", ep=ep, epochs=total,
+                  elapsed=_fmt_duracao(decorrido), eta=_fmt_duracao(restante))
         try:
-            barra.progress(min(ep / max(int(epochs), 1), 1.0))
-            status.text(f"Época {ep}/{epochs}…")
+            barra.progress(min(ep / total, 1.0), text=texto)
+            if status is not None:
+                status.text(texto)
         except Exception:
             pass
 
@@ -2117,144 +3015,150 @@ def _rect_para_box(o, escala):
             round(w * escala, 1), round(h * escala, 1)]
 
 
+# --- Anotação: ciclo reanotar -> treinar -> dados ---
+
+def _n_modelos_treinados() -> int:
+    """Quantos modelos foram treinados no app (beemove_*.pt na pasta de modelos)."""
+    try:
+        return sum(1 for _ in _TRAINED_DIR.glob("beemove_*.pt"))
+    except Exception:
+        return 0
+
+
+def _assinatura_dataset(anotados) -> tuple:
+    """Muda sempre que as anotações mudam: nº de itens, maior id e conteúdo."""
+    if not anotados:
+        return (0, 0, 0)
+    conteudo = json.dumps([(c["id"], c.get("status"), c.get("labels"))
+                           for c in anotados])
+    return (len(anotados), max(c["id"] for c in anotados),
+            zlib.crc32(conteudo.encode()))
+
+
+def _proximo_pendente(lista, atual_id):
+    """Id do próximo candidato pendente depois de `atual_id` (circular) ou None."""
+    ids = [c["id"] for c in lista]
+    i = ids.index(atual_id) if atual_id in ids else -1
+    for k in range(1, len(lista) + 1):
+        c = lista[(i + k) % len(lista)]
+        if c["id"] != atual_id and c.get("status") == "pendente":
+            return c["id"]
+    return None
+
+
 def render_anotacao(user_id):
-    """Reanotação de candidatos (abelhas mal/não detectadas) + export do dataset YOLO."""
-    ui.header("Anotação para fine-tuning",
-              "Corrija as detecções fracas e gere um dataset YOLO")
+    """Ciclo de melhoria do modelo: reanotar candidatos, treinar e dados."""
+    ui.header(t("annot.title"), t("annot.subtitle"))
     cont = database.candidate_counts(user_id)
     pend = cont.get("pendente", 0)
     anot = cont.get("anotado", 0) + cont.get("sem_abelha", 0)
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Pendentes", pend)
-    c2.metric("Anotados", anot)
-    c3.metric("Descartados", cont.get("descartado", 0))
+    desc = cont.get("descartado", 0)
+    coletados = pend + anot + desc
+    n_ext = contar_externo()[0]
+    st.markdown(t("annot.progress_line", collected=coletados, pending=pend,
+                  annotated=anot, discarded=desc, trained=_n_modelos_treinados()))
 
-    if pend + anot == 0:
-        st.info("Nenhum candidato coletado ainda. Marque **'🏷️ Coletar candidatos "
-                "para reanotação'** na barra lateral e processe um vídeo — ou "
-                "importe um dataset externo abaixo e treine direto.")
+    secoes = {"label": t("annot.section_label", n=pend),
+              "train": t("annot.section_train"),
+              "data": t("annot.section_data")}
+    padrao = "label" if pend > 0 or (anot == 0 and n_ext == 0) else "train"
+    if st.session_state.get("anot_secao") not in (None, *secoes):
+        st.session_state.pop("anot_secao", None)
+    ult = st.session_state.get("_keep_anot_secao")
+    secao = st.segmented_control(
+        t("annot.section"), list(secoes), format_func=secoes.get,
+        key="anot_secao", required=True,
+        default=ult if ult in secoes else padrao, label_visibility="collapsed")
+    if secao not in secoes:
+        secao = padrao
+    st.session_state["_keep_anot_secao"] = secao
 
-    # --- Importar dataset externo (imagens originais do YOLOv4) ---
-    with st.expander("📥 Importar imagens externas (dataset YOLO)", expanded=False):
-        n_ext_i, n_ext_l = contar_externo()
-        st.caption(f"Dataset externo atual: **{n_ext_i} imagem(ns)**, {n_ext_l} "
-                   "arquivo(s) de rótulo. Importe aqui as imagens originais usadas "
-                   "no YOLOv4 (formato YOLO: imagens + .txt). Elas entram no treino "
-                   "junto com as reanotadas.")
-        zf = st.file_uploader("Arquivo .zip (imagens + labels YOLO)", type=["zip"],
-                              key="ext_zip")
-        if zf is not None and st.button("Importar .zip"):
-            try:
-                ni, nl = importar_dataset_zip(zf.getvalue())
-                log_event("dataset_imported", f"Dataset externo: +{ni} imgs, +{nl} labels",
-                          user_id=user_id)
-                st.success(f"Importado: +{ni} imagem(ns), +{nl} rótulo(s).")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Falha ao importar: {e}")
-        if n_ext_i > 0 and st.button("🗑️ Limpar dataset externo"):
-            limpar_externo()
-            st.rerun()
+    if secao == "label":
+        _anot_reanotar(user_id, coletados)
+    elif secao == "train":
+        _anot_treinar(user_id, anot, n_ext)
+    else:
+        _anot_dados(user_id)
 
-    # --- Exportar dataset YOLO ---
-    with st.expander("📦 Exportar dataset YOLO", expanded=False):
-        anotados = database.list_annotated_candidates(user_id)
-        res = dataset.resumo(anotados)
-        st.caption(f"{res['imagens']} imagem(ns) · {res['caixas']} caixa(s) · "
-                   f"{res['negativas']} negativa(s) (sem abelha). Inclui apenas "
-                   "candidatos com status *anotado* ou *sem abelha*.")
-        if res["imagens"] > 0 and st.button("Gerar dataset (.zip)"):
-            st.session_state["dataset_zip"] = dataset.build_yolo_zip(anotados)
-            log_event("dataset_exported",
-                      f"Dataset YOLO ({res['imagens']} imgs, {res['caixas']} caixas)",
-                      user_id=user_id)
-        if st.session_state.get("dataset_zip"):
-            st.download_button("⬇️ Baixar dataset YOLO", data=st.session_state["dataset_zip"],
-                               file_name="dataset_yolo_beetracker.zip",
-                               mime="application/zip")
 
-    # --- Treinar modelo (fine-tuning Ultralytics) ---
-    with st.expander("🎓 Treinar modelo (fine-tuning)", expanded=False):
-        if not _ultralytics_disponivel():
-            st.warning("Ultralytics não está instalado nesta imagem. Reconstrua a "
-                       "imagem (o `ultralytics` foi adicionado ao requirements) para "
-                       "habilitar o treino dentro do app.")
-        else:
-            anotados = database.list_annotated_candidates(user_id)
-            res = dataset.resumo(anotados)
-            n_ext_i, _ = contar_externo()
-            total_imgs = res["imagens"] + n_ext_i
-            st.caption(f"Treina um modelo YOLO (Ultralytics) com **{res['imagens']} "
-                       f"reanotada(s)** + **{n_ext_i} externa(s)** = {total_imgs} "
-                       "imagem(ns). O modelo `.pt` resultante fica salvo e pode ser "
-                       "selecionado/comparado na **Administração**.")
-            base = st.selectbox("Modelo base", ["yolov8n.pt", "yolov8s.pt",
-                                                "yolo11n.pt", "yolo11s.pt"],
-                                help="Modelos leves treinam mais rápido. Baixados "
-                                     "automaticamente na 1ª vez (requer internet).")
-            cep, cimg = st.columns(2)
-            epochs = cep.slider("Épocas", 10, 300, 100, 10)
-            imgsz = cimg.select_slider("imgsz (resolução)", [320, 416, 512, 640],
-                                       value=640)
-            if total_imgs < 5:
-                st.info("Reúna ao menos ~5 imagens (reanotadas e/ou importadas; "
-                        "idealmente dezenas) para um treino mínimo viável.")
-            elif st.button("🚀 Treinar agora", type="primary"):
-                barra = st.progress(0.0)
-                status = st.empty()
-                try:
-                    with st.spinner("Treinando — pode levar vários minutos…"):
-                        destino, ni, nc = treinar_modelo(
-                            user_id, base, epochs, imgsz, barra, status)
-                    log_event("model_trained",
-                              f"Treino Ultralytics: {destino.name} ({ni} imgs, {nc} caixas)",
-                              user_id=user_id)
-                    if destino.exists():
-                        st.success(f"✅ Treino concluído! Modelo salvo como "
-                                   f"**{destino.name}**. Ative-o na aba "
-                                   "**⚙️ Administração → 🧠 Modelo de detecção** "
-                                   "para comparar os resultados.")
-                    else:
-                        st.error("Treino terminou mas o arquivo do modelo não foi "
-                                 "encontrado. Verifique os logs.")
-                except Exception as e:
-                    st.error(f"Falha no treino: {e}")
-                    log_event("model_train_failed", f"Erro no treino: {e}",
-                              user_id=user_id, level=logging.ERROR)
-                finally:
-                    barra.empty()
-                    status.empty()
-
-    # --- Seleção do candidato a reanotar ---
-    if pend + anot == 0:
-        return  # sem candidatos: só import/export/treino acima
-    st.markdown("### ✍️ Reanotar candidatos")
+def _anot_reanotar(user_id, coletados):
+    """Reanotação: um candidato por vez, com anterior/próximo e avanço automático."""
+    if coletados == 0:
+        st.info(t("annot.no_candidates"))
+        return
     try:
         _patch_canvas_compat()
         from streamlit_drawable_canvas import st_canvas
         from PIL import Image
     except Exception:
-        st.warning("Componente de desenho indisponível nesta instalação.")
+        st.warning(t("annot.no_canvas"))
         return
 
-    filtro = st.radio("Mostrar", ["Pendentes", "Todos"], horizontal=True,
-                      key="anot_filtro")
+    _filtros = ["pendente", "todos"]
+    _ult_f = st.session_state.get("_keep_anot_filtro")
+    c_filtro, c_ir = st.columns([1, 2], vertical_alignment="bottom")
+    filtro = c_filtro.segmented_control(
+        t("annot.show"), _filtros, key="anot_filtro", required=True,
+        default=_ult_f if _ult_f in _filtros else "pendente",
+        format_func={v: t(f"annot.filter_{v}") for v in _filtros}.get)
+    if filtro not in _filtros:
+        filtro = "pendente"
+    st.session_state["_keep_anot_filtro"] = filtro
     lista = database.list_candidates(user_id,
-                                     status="pendente" if filtro == "Pendentes" else None)
+                                     status="pendente" if filtro == "pendente" else None)
     if not lista:
-        st.success("Nenhum candidato pendente — tudo anotado! 🎉")
+        st.success(t("annot.all_done"))
         return
 
     def _rotulo(c):
         area = f" · {c['area']}" if c.get("area") else ""
-        return (f"#{c['id']}{area} · frame {c['frame_index']} · {c['reason']} "
-                f"· conf {c['pred_conf']:.2f} · [{c['status']}]")
+        conf = (t("annot.position_conf", conf=c["pred_conf"])
+                if c.get("pred_conf") is not None else "")
+        return t("annot.candidate_label", id=c["id"], area=area,
+                 frame=c["frame_index"], reason=t(f"annot.reason_{c['reason']}"),
+                 conf=conf, status=t(f"annot.status_{c['status']}"))
 
-    opcoes = {_rotulo(c): c["id"] for c in lista}
-    escolhido = st.selectbox("Candidato", list(opcoes.keys()), key="anot_sel")
-    cand = database.get_candidate(opcoes[escolhido], user_id)
+    rotulos = {c["id"]: _rotulo(c) for c in lista}
+    ids = list(rotulos)
+    # Pedido de navegação (anterior/próximo/avanço após salvar) feito na
+    # execução anterior: aplica antes de desenhar o seletor.
+    alvo = st.session_state.pop("_anot_goto", None)
+    for candidato in (alvo, st.session_state.get("anot_sel"),
+                      st.session_state.get("_keep_anot_sel")):
+        if candidato in ids:
+            alvo = candidato
+            break
+    else:
+        alvo = ids[0]
+    st.session_state["anot_sel"] = alvo
+    escolhido = c_ir.selectbox(t("annot.jump_to"), ids, key="anot_sel",
+                               format_func=lambda i: rotulos.get(i, str(i)))
+    st.session_state["_keep_anot_sel"] = escolhido
+    pos = ids.index(escolhido)
+    info = lista[pos]
+
+    c_ant, c_txt, c_prox = st.columns([1, 4, 1], vertical_alignment="center")
+    if c_ant.button(t("annot.prev_btn"), key="anot_prev", width="stretch",
+                    disabled=pos == 0):
+        st.session_state["_anot_goto"] = ids[pos - 1]
+        st.rerun()
+    if c_prox.button(t("annot.next_btn"), key="anot_next", width="stretch",
+                     disabled=pos >= len(ids) - 1):
+        st.session_state["_anot_goto"] = ids[pos + 1]
+        st.rerun()
+    area = t("annot.position_area", area=_md_esc(info["area"])) if info.get("area") else ""
+    c_txt.markdown(t("annot.position", i=pos + 1, n=len(ids),
+                     video=_md_esc(info.get("video_name") or "—"), area=area,
+                     frame=info["frame_index"]))
+    conf = (t("annot.position_conf", conf=info["pred_conf"])
+            if info.get("pred_conf") is not None else "")
+    c_txt.caption(t("annot.position_detail",
+                    reason=t(f"annot.reason_{info['reason']}"), conf=conf,
+                    status=t(f"annot.status_{info['status']}")))
+
+    cand = database.get_candidate(escolhido, user_id)
     if not cand or not cand.get("image_jpg"):
-        st.warning("Candidato sem imagem.")
+        st.warning(t("annot.no_image"))
         return
 
     frame = cv2.imdecode(np.frombuffer(cand["image_jpg"], np.uint8), cv2.IMREAD_COLOR)
@@ -2273,9 +3177,13 @@ def render_anotacao(user_id):
     init = {"version": "4.4.0",
             "objects": [_box_para_rect_canvas(b, escala) for b in (base or [])]}
 
-    st.markdown("Desenhe um **retângulo por abelha** (clique e arraste). Selecione "
-                "uma caixa para mover/redimensionar; use a lixeira da barra do canvas "
-                "para excluir. Se não houver abelha, use *Sem abelha*.")
+    def _avancar():
+        """Depois de salvar/marcar/descartar, abre o próximo pendente."""
+        prox = _proximo_pendente(lista, cand["id"])
+        if prox is not None:
+            st.session_state["_anot_goto"] = prox
+
+    st.markdown(t("annot.draw_instructions"))
     col_canvas, col_acoes = st.columns([3, 1])
     with col_canvas:
         canvas = st_canvas(
@@ -2285,200 +3193,746 @@ def render_anotacao(user_id):
             key=f"canvas_anot_{cand['id']}",
         )
     with col_acoes:
-        st.caption(f"Frame {cand['frame_index']} · {largura}×{altura}px")
-        if st.button("💾 Salvar anotação", type="primary", width="stretch"):
+        st.caption(t("annot.frame_info", w=largura, h=altura))
+        if st.button(t("annot.save_btn"), type="primary", width="stretch",
+                     key="anot_salvar"):
             objs = (canvas.json_data or {}).get("objects") if canvas else None
             caixas = [_rect_para_box(o, escala) for o in (objs or [])
                       if o.get("type") in ("rect", "Rect") and o.get("width")]
             caixas = [b for b in caixas if b[2] > 1 and b[3] > 1]
             if not caixas:
-                st.warning("Nenhuma caixa desenhada. Use *Sem abelha* se for o caso.")
+                st.warning(t("annot.no_boxes"))
             else:
                 database.set_candidate_labels(cand["id"], user_id, caixas, "anotado")
-                st.success(f"{len(caixas)} caixa(s) salvas.")
+                ui.flash(t("annot.boxes_saved", n=len(caixas)))
+                _avancar()
                 st.rerun()
-        if st.button("🚫 Sem abelha (negativa)", width="stretch"):
+        if st.button(t("annot.no_bee_btn"), width="stretch", key="anot_sem_abelha"):
             database.set_candidate_labels(cand["id"], user_id, [], "sem_abelha")
+            ui.flash(t("annot.flash_no_bee", id=cand["id"]), "info")
+            _avancar()
             st.rerun()
-        if st.button("🗑️ Descartar", width="stretch"):
+        if st.button(t("annot.discard_btn"), width="stretch", key="anot_descartar",
+                     help=t("annot.discard_help")):
             database.set_candidate_labels(cand["id"], user_id, [], "descartado")
+            ui.flash(t("annot.flash_discarded", id=cand["id"]), "info")
+            _avancar()
             st.rerun()
+        st.caption(t("annot.auto_advance_hint"))
+
+
+def _aplicar_perfil_treino():
+    """on_change do perfil: leva o preset para os controles avançados."""
+    p = PERFIS_TREINO.get(st.session_state.get("train_perfil"))
+    if p:
+        st.session_state["train_base"] = p["base"]
+        st.session_state["train_epochs"] = p["epochs"]
+        st.session_state["train_imgsz"] = p["imgsz"]
+
+
+def _anot_treinar(user_id, n_anotados, n_ext):
+    """Treino (fine-tuning Ultralytics): perfil simples + controles avançados."""
+    import traceback
+
+    if not _ultralytics_disponivel():
+        st.warning(t("annot.no_ultralytics"))
+        return
+    total_imgs = n_anotados + n_ext
+    st.markdown(t("annot.train_caption", n_reannot=n_anotados, n_ext=n_ext,
+                  total=total_imgs))
+    disp, nome_gpu = dispositivo_treino()
+    if disp == "gpu":
+        st.info(t("annot.train_on_gpu", name=nome_gpu or "CUDA"))
+    else:
+        st.warning(t("annot.train_on_cpu"))
+
+    perfis = {k: t(f"annot.profile_{k}") for k in PERFIS_TREINO}
+    if st.session_state.get("train_perfil") not in (None, *perfis):
+        st.session_state.pop("train_perfil", None)
+    ult = st.session_state.get("_keep_train_perfil")
+    padrao = ult if ult in perfis else ("fast" if disp == "cpu" else "balanced")
+    perfil = st.segmented_control(
+        t("annot.profile"), list(perfis), format_func=perfis.get,
+        key="train_perfil", required=True, default=padrao,
+        on_change=_aplicar_perfil_treino, help=t("annot.profile_help"))
+    if perfil not in perfis:
+        perfil = padrao
+    st.session_state["_keep_train_perfil"] = perfil
+    st.caption(t(f"annot.profile_{perfil}_desc"))
+
+    preset = PERFIS_TREINO[perfil]
+    validos = {"train_base": MODELOS_BASE, "train_imgsz": [320, 416, 512, 640]}
+    for k, v in (("train_base", preset["base"]), ("train_epochs", preset["epochs"]),
+                 ("train_imgsz", preset["imgsz"])):
+        atual = st.session_state.get(k)
+        if atual is None or (k in validos and atual not in validos[k]):
+            st.session_state[k] = v
+    with st.expander(t("annot.advanced")):
+        base = st.selectbox(t("annot.base_model"), MODELOS_BASE, key="train_base",
+                            help=t("annot.base_model_help"))
+        cep, cimg = st.columns(2)
+        epochs = cep.slider(t("annot.epochs"), 10, 300, step=10, key="train_epochs",
+                            help=t("annot.epochs_help"))
+        imgsz = cimg.select_slider(t("annot.imgsz"), [320, 416, 512, 640],
+                                   key="train_imgsz", help=t("annot.imgsz_help"))
+    st.caption(t("annot.train_summary", base=base, epochs=epochs, imgsz=imgsz))
+
+    if total_imgs < 5:
+        st.info(t("annot.need_more_images"))
+        return
+    st.warning(t("annot.train_keep_page_open"))
+    if not st.button(t("annot.train_btn"), type="primary", key="train_go"):
+        return
+
+    destino = erro = None
+    with st.status(t("annot.training_status"), expanded=True) as caixa:
+        barra = st.progress(0.0, text=t("annot.training_preparing"))
+        try:
+            destino, ni, nc = treinar_modelo(user_id, base, epochs, imgsz, barra)
+            log_event("model_trained",
+                      f"Treino Ultralytics: {destino.name} ({ni} imgs, {nc} caixas)",
+                      user_id=user_id)
+            caixa.update(label=t("annot.training_done_status"), state="complete",
+                         expanded=False)
+        except Exception as e:
+            erro = e
+            detalhe = "".join(traceback.format_exception(e))
+            log_event("model_train_failed", f"Erro no treino: {e}",
+                      user_id=user_id, level=logging.ERROR)
+            caixa.update(label=t("annot.training_failed_status"), state="error",
+                         expanded=False)
+        finally:
+            barra.empty()
+
+    if erro is not None:
+        tipo = erro_treino_amigavel(erro)
+        st.error(t(f"annot.train_err_{tipo}", base=base))
+        with st.expander(t("annot.train_error_details")):
+            st.code(detalhe, language=None)
+    elif destino is not None and destino.exists():
+        chave = ("annot.train_ok_admin" if st.session_state.get("role") == "admin"
+                 else "annot.train_ok_user")
+        st.success(t(chave, name=destino.name))
+    else:
+        st.error(t("annot.train_no_file"))
+
+
+def _relatorio_importacao(r):
+    """Resumo em linguagem simples do que veio no .zip importado."""
+    if not r.get("imagens"):
+        st.warning(t("annot.import_no_images", n_lbl=r.get("rotulos", 0)))
+        return
+    st.success(t("annot.import_report", n=r["imagens"], with_lbl=r["com_rotulo"],
+                 without=r["sem_rotulo"]))
+    if r["sem_rotulo"]:
+        st.caption(t("annot.import_report_negatives", n=r["sem_rotulo"]))
+    if r["rotulos_orfaos"]:
+        st.warning(t("annot.import_report_orphans", n=r["rotulos_orfaos"]))
+
+
+def _anot_dados(user_id):
+    """Importar imagens externas (dataset YOLO) e exportar o dataset reanotado."""
+    import zipfile
+
+    with st.container(border=True):
+        st.markdown(t("annot.import_title"))
+        n_ext_i, n_ext_l = contar_externo()
+        st.caption(t("annot.import_caption", n_img=n_ext_i, n_lbl=n_ext_l))
+        rel = st.session_state.pop("_anot_import_rel", None)
+        if isinstance(rel, dict):
+            _relatorio_importacao(rel)
+        n_up = st.session_state.get("_anot_zip_n", 0)
+        zf = st.file_uploader(t("annot.zip_uploader"), type=["zip"],
+                              key=f"ext_zip_{n_up}")
+        c_imp, c_limpar = st.columns(2)
+        if c_imp.button(t("annot.import_zip_btn"), key="anot_importar",
+                        disabled=zf is None, type="primary", width="stretch"):
+            try:
+                r = importar_dataset_zip(zf.getvalue())
+                log_event("dataset_imported",
+                          f"Dataset externo: +{r['imagens']} imgs, +{r['rotulos']} labels",
+                          user_id=user_id)
+                st.session_state["_anot_import_rel"] = r
+                st.session_state["_anot_zip_n"] = n_up + 1   # limpa o seletor
+                st.rerun()
+            except zipfile.BadZipFile:
+                st.error(t("annot.import_bad_zip"))
+            except Exception as e:
+                st.error(t("annot.import_failed", err=e))
+        if n_ext_i > 0 and c_limpar.button(t("annot.clear_external_btn"),
+                                           key="anot_limpar_externo", width="stretch"):
+            def _limpar():
+                limpar_externo()
+                log_event("dataset_cleared", "Dataset externo removido",
+                          user_id=user_id)
+            ui.confirm_delete(
+                t("annot.clear_external_dialog_title"),
+                t("annot.clear_external_dialog_body", n_img=n_ext_i, n_lbl=n_ext_l),
+                _limpar, t("annot.clear_external_done"), key="dlg_limpar_externo")
+
+    with st.container(border=True):
+        st.markdown(t("annot.export_title"))
+        anotados = database.list_annotated_candidates(user_id)
+        res = dataset.resumo(anotados)
+        st.caption(t("annot.export_caption", n_img=res["imagens"],
+                     n_box=res["caixas"], n_neg=res["negativas"]))
+        if res["imagens"] == 0:
+            st.info(t("annot.export_empty"))
+            return
+        assinatura = _assinatura_dataset(anotados)
+        cache = st.session_state.get("dataset_zip")
+        if not isinstance(cache, dict) or cache.get("user") != user_id:
+            cache = None
+        desatualizado = cache is not None and cache.get("sig") != assinatura
+        if desatualizado:
+            st.info(t("annot.export_outdated"))
+        if cache is None or desatualizado:
+            rotulo = (t("annot.rebuild_zip_btn") if desatualizado
+                      else t("annot.build_zip_btn"))
+            if st.button(rotulo, key="anot_gerar_zip"):
+                with st.spinner(t("annot.building_zip")):
+                    dados = dataset.build_yolo_zip(anotados)
+                cache = {"user": user_id, "sig": assinatura, "data": dados,
+                         "name": f"dataset_yolo_beemove_{datetime.now():%Y%m%d}.zip"}
+                st.session_state["dataset_zip"] = cache
+                desatualizado = False
+                log_event("dataset_exported",
+                          f"Dataset YOLO ({res['imagens']} imgs, {res['caixas']} caixas)",
+                          user_id=user_id)
+        if cache is not None and not desatualizado:
+            st.download_button(t("annot.download_zip_btn"), data=cache["data"],
+                               file_name=cache["name"], mime="application/zip",
+                               type="primary", key="anot_baixar_zip")
+            st.caption(t("annot.download_zip_caption", name=cache["name"]))
+
+
+# --- Administração: usuários e modelos ---
+
+LIMITE_AVALIACAO = 80   # nº máx. de imagens usadas por itens_avaliacao()
+
+
+def _tipo_modelo(m) -> str:
+    """'original' (YOLOv4 do projeto), 'bundled', 'trained' (no app) ou 'uploaded'."""
+    p = Path(m["weights"])
+    try:
+        no_projeto = p.resolve().parent == _MODELS_DIR.resolve()
+    except Exception:
+        no_projeto = False
+    if no_projeto:
+        return "original" if p.suffix.lower() == ".weights" else "bundled"
+    return "trained" if p.name.startswith("beemove_") else "uploaded"
+
+
+def _info_arquivo(caminho):
+    """(data de modificação, tamanho em MB) de um arquivo; (None, None) se falhar."""
+    try:
+        stt = os.stat(caminho)
+        return datetime.fromtimestamp(stt.st_mtime), stt.st_size / 1e6
+    except OSError:
+        return None, None
 
 
 def render_admin(current_user_id, input_size, usar_gpu, fp16, nms, class_names):
-    """Painel de administração: usuários, modelo ativo e comparação de modelos."""
-    ui.header("Administração", "Gestão de usuários e modelos")
+    """Painel de administração: abas de usuários e de modelos."""
+    ui.header(t("admin.title"), t("admin.subtitle"))
+    aba_usuarios, aba_modelos = st.tabs([t("admin.tab_users"), t("admin.tab_models")])
+    with aba_usuarios:
+        _admin_usuarios(current_user_id)
+    with aba_modelos:
+        _admin_modelos(current_user_id, input_size, usar_gpu, fp16, nms, class_names)
+
+
+def _admin_usuarios(current_user_id):
     usuarios = database.list_users()
-
-    df = pd.DataFrame([{
-        "ID": u["id"],
-        "Usuário": u["username"],
-        "Perfil": "Administrador" if u["role"] == "admin" else "Comum",
-        "Análises": u["n_analises"],
-        "Criado em": (u["created_at"] or "")[:16],
-        "Último acesso": (u["last_login_at"] or "—")[:16],
-    } for u in usuarios])
-    st.dataframe(df, hide_index=True, width="stretch")
-    st.caption(f"{len(usuarios)} usuário(s) · {database.count_admins()} administrador(es). "
-               "Excluir um usuário remove também todas as análises dele.")
-
-    col_novo, col_gerir = st.columns(2)
-    with col_novo:
-        st.markdown("#### ➕ Novo usuário")
+    c_cap, c_novo = st.columns([3, 1], vertical_alignment="bottom")
+    c_cap.caption(t("admin.users_caption", n=len(usuarios),
+                    n_admins=database.count_admins()))
+    with c_novo.popover(t("admin.new_user_btn"), width="stretch"):
         with st.form("admin_novo_user", clear_on_submit=True):
-            nu = st.text_input("Usuário")
-            ns = st.text_input("Senha", type="password")
-            nr = st.selectbox("Perfil", ["Comum", "Administrador"])
-            if st.form_submit_button("Criar usuário", type="primary",
+            nu = st.text_input(t("admin.username"))
+            ns = st.text_input(t("admin.password"), type="password")
+            papeis = {"user": t("admin.role_user"), "admin": t("admin.role_admin")}
+            nr = st.selectbox(t("admin.role"), list(papeis), format_func=papeis.get)
+            if st.form_submit_button(t("admin.create_user"), type="primary",
                                      width="stretch"):
-                ok, msg = auth.admin_create_user(
-                    nu, ns, "admin" if nr == "Administrador" else "user")
+                ok, msg = auth.admin_create_user(nu, ns, nr)
                 if ok:
-                    st.success(msg)
+                    ui.flash(msg)
                     st.rerun()
                 else:
                     st.error(msg)
+    if not usuarios:
+        return
 
-    with col_gerir:
-        st.markdown("#### 🛠️ Gerenciar usuário")
-        opcoes = {f"#{u['id']} — {u['username']}": u for u in usuarios}
-        sel = st.selectbox("Selecione o usuário", list(opcoes.keys()),
-                           key="admin_sel_user")
-        alvo = opcoes[sel]
-        eh_proprio = alvo["id"] == current_user_id
+    ids = [u["id"] for u in usuarios]
+    df = pd.DataFrame([{
+        "user": u["username"] + (t("admin.you_suffix") if u["id"] == current_user_id
+                                 else ""),
+        "role": (t("admin.role_admin") if u["role"] == "admin" else t("admin.role_user")),
+        "analyses": u["n_analises"],
+        "created": _fmt_data(u["created_at"]) if u["created_at"] else "—",
+        "last_login": _fmt_data(u["last_login_at"]) if u["last_login_at"] else "—",
+    } for u in usuarios])
+    ult = st.session_state.get("_keep_admin_user")
+    linha_padrao = ids.index(ult) if ult in ids else (
+        ids.index(current_user_id) if current_user_id in ids else 0)
+    evento = st.dataframe(
+        df, hide_index=True, width="stretch",
+        key=f"admin_users_tbl_{zlib.crc32(','.join(map(str, ids)).encode())}",
+        on_select="rerun", selection_mode="single-row",
+        selection_default={"selection": {"rows": [linha_padrao]}},
+        column_config={
+            "user": st.column_config.TextColumn(t("admin.col_user")),
+            "role": st.column_config.TextColumn(t("admin.col_role")),
+            "analyses": st.column_config.NumberColumn(t("admin.col_analyses")),
+            "created": st.column_config.TextColumn(t("admin.col_created")),
+            "last_login": st.column_config.TextColumn(t("admin.col_last_login")),
+        },
+        height=min(38 + 35 * len(ids), 320),
+    )
+    try:
+        linhas = list(evento["selection"]["rows"])
+    except (KeyError, TypeError):
+        linhas = []
+    if not linhas or not 0 <= linhas[0] < len(usuarios):
+        st.info(t("admin.select_user_hint"))
+        return
+    alvo = usuarios[linhas[0]]
+    st.session_state["_keep_admin_user"] = alvo["id"]
+    eh_proprio = alvo["id"] == current_user_id
 
+    with st.container(border=True):
+        st.markdown(t("admin.selected_user_title", name=_md_esc(alvo["username"])))
+        st.caption(t("admin.selected_user_caption",
+                     role=(t("admin.role_admin") if alvo["role"] == "admin"
+                           else t("admin.role_user")),
+                     n=alvo.get("n_analises", 0) or 0,
+                     last=(_fmt_data(alvo["last_login_at"])
+                           if alvo.get("last_login_at") else "—")))
         novo_papel = "user" if alvo["role"] == "admin" else "admin"
-        rotulo_papel = ("Rebaixar para Comum" if alvo["role"] == "admin"
-                        else "Promover a Administrador")
+        rotulo_papel = (t("admin.demote_to_user") if alvo["role"] == "admin"
+                        else t("admin.promote_to_admin"))
         c1, c2 = st.columns(2)
         if c1.button(rotulo_papel, width="stretch", key="admin_toggle_role"):
             ok, msg = auth.admin_set_role(alvo["id"], novo_papel)
             if ok:
-                st.success(msg)
+                ui.flash(msg)
                 st.rerun()
             else:
                 st.error(msg)
-        if c2.button("🗑️ Excluir", width="stretch", key="admin_del_user",
+        if c2.button(t("admin.delete_user"), width="stretch", key="admin_del_user",
                      disabled=eh_proprio,
-                     help="Você não pode excluir a própria conta." if eh_proprio else None):
-            ok, msg = auth.admin_delete_user(alvo["id"])
-            if ok:
-                st.success(msg)
-                st.rerun()
-            else:
-                st.error(msg)
+                     help=t("admin.cannot_delete_self") if eh_proprio else None):
+            def _excluir_usuario(uid=alvo["id"]):
+                ok, msg = auth.admin_delete_user(uid)
+                return None if ok else msg
+            ui.confirm_delete(
+                t("admin.delete_user_dialog_title", name=alvo["username"]),
+                t("admin.delete_user_dialog_body", name=ui.esc(alvo["username"]),
+                  n=alvo.get("n_analises", 0) or 0),
+                _excluir_usuario,
+                t("admin.delete_user_done", name=alvo["username"]),
+                key="dlg_excluir_usuario")
 
         with st.form("admin_reset_pwd", clear_on_submit=True):
-            nova = st.text_input("Redefinir senha do usuário", type="password")
-            if st.form_submit_button("Redefinir senha", width="stretch"):
+            nova = st.text_input(t("admin.reset_password_label"), type="password")
+            if st.form_submit_button(t("admin.reset_password_btn"), width="stretch"):
                 ok, msg = auth.admin_reset_password(alvo["id"], nova)
                 (st.success if ok else st.error)(msg)
 
+
+def _admin_modelos(current_user_id, input_size, usar_gpu, fp16, nms, class_names):
     # --- Subir modelo pré-treinado (fora da plataforma) ---
-    st.markdown("---")
-    st.markdown("#### 📤 Subir modelo pré-treinado")
-    st.caption("Envie um modelo treinado fora daqui: **.pt** (Ultralytics) ou "
-               "**.weights + .cfg** (Darknet/YOLOv4). Ele passa a aparecer na "
-               "seleção e na comparação abaixo. Modelos ficam no volume de dados.")
-    ups = st.file_uploader("Arquivos do modelo (.pt, ou .weights + .cfg)",
-                           type=["pt", "weights", "cfg"], accept_multiple_files=True,
-                           key="admin_upload_modelo")
-    if ups and st.button("Enviar modelo(s)", key="admin_enviar_modelo"):
-        try:
-            salvos, erros = importar_modelo_upload(ups)
-            if salvos:
-                log_event("model_uploaded", f"Upload de modelo: {', '.join(salvos)}",
-                          user_id=current_user_id)
-                st.success("Salvo: " + " · ".join(salvos))
-            for e in erros:
-                st.warning(e)
-        except Exception as e:
-            st.error(f"Falha no upload: {e}")
+    with st.expander(t("admin.upload_title")):
+        st.caption(t("admin.upload_caption"))
+        ups = st.file_uploader(t("admin.upload_files_label"),
+                               type=["pt", "weights", "cfg"], accept_multiple_files=True,
+                               key="admin_upload_modelo")
+        if ups and st.button(t("admin.upload_btn"), key="admin_enviar_modelo"):
+            try:
+                salvos, erros = importar_modelo_upload(ups)
+                if salvos:
+                    log_event("model_uploaded", f"Upload de modelo: {', '.join(salvos)}",
+                              user_id=current_user_id)
+                    st.success(t("admin.upload_saved", files=" · ".join(salvos)))
+                for e in erros:
+                    st.warning(e)
+            except Exception as e:
+                st.error(t("admin.upload_failed", error=e))
 
     # --- Modelo de detecção ativo ---
-    st.markdown("---")
-    st.markdown("#### 🧠 Modelo de detecção")
+    st.markdown(t("admin.model_title"))
     modelos = listar_modelos()
     _, weights_atual = modelo_ativo()
     if not modelos:
-        st.info(f"Nenhum modelo encontrado em `{_MODELS_DIR}` ou `{_TRAINED_DIR}`. "
-                "Coloque os pesos lá ou treine um na aba *🏷️ Anotação*.")
+        st.info(t("admin.no_models_found", models_dir=_MODELS_DIR,
+                  trained_dir=_TRAINED_DIR))
+        return
+    atual_nome = os.path.basename(weights_atual)
+    cmp_res = st.session_state.get("admin_cmp")
+    ultimo_f1 = {}
+    if isinstance(cmp_res, dict) and isinstance(cmp_res.get("df"), pd.DataFrame):
+        ultimo_f1 = {r["model"]: r["f1"] for _, r in cmp_res["df"].iterrows()
+                     if pd.notna(r.get("f1"))}
+    linhas_mod = []
+    for m in modelos:
+        data, mb = _info_arquivo(m["weights"])
+        linhas_mod.append({
+            "active": m["nome"] == atual_nome, "name": m["nome"],
+            "type": t(f"admin.mtype_{_tipo_modelo(m)}"),
+            "date": data, "size": mb, "f1": ultimo_f1.get(m["nome"]),
+        })
+    df_mod = pd.DataFrame(linhas_mod)
+    nomes = [m["nome"] for m in modelos]
+    linha_padrao = nomes.index(atual_nome) if atual_nome in nomes else 0
+    colunas = ["active", "name", "type", "date", "size"]
+    if ultimo_f1:
+        colunas.append("f1")
+    evento = st.dataframe(
+        df_mod, hide_index=True, width="stretch",
+        key=f"admin_models_tbl_{zlib.crc32(','.join(nomes).encode())}",
+        on_select="rerun", selection_mode="single-row",
+        selection_default={"selection": {"rows": [linha_padrao]}},
+        column_order=colunas,
+        column_config={
+            "active": st.column_config.CheckboxColumn(t("admin.col_active"),
+                                                      width="small"),
+            "name": st.column_config.TextColumn(t("admin.col_model")),
+            "type": st.column_config.TextColumn(t("admin.col_type")),
+            "date": st.column_config.DatetimeColumn(
+                t("admin.col_date"), format=t("history.date_column_format")),
+            "size": st.column_config.NumberColumn(t("admin.col_size"),
+                                                  format="%.1f MB"),
+            "f1": st.column_config.NumberColumn(t("admin.col_last_f1"), format="%.2f",
+                                                help=t("admin.help_last_f1")),
+        },
+    )
+    try:
+        sel = list(evento["selection"]["rows"])
+    except (KeyError, TypeError):
+        sel = []
+    escolhido = modelos[sel[0]] if sel and 0 <= sel[0] < len(modelos) else None
+    ja_ativo = escolhido is not None and escolhido["nome"] == atual_nome
+    c_btn, c_cap = st.columns([1, 3], vertical_alignment="center")
+    if c_btn.button(t("admin.activate_selected"), type="primary",
+                    key="admin_aplicar_modelo", width="stretch",
+                    disabled=escolhido is None or ja_ativo):
+        database.set_setting("active_weights", escolhido["weights"])
+        database.set_setting("active_cfg", escolhido["cfg"])
+        carregar_modelo.clear()   # invalida o cache p/ recarregar os novos pesos
+        log_event("model_selected", f"Modelo ativo: {escolhido['nome']}",
+                  user_id=current_user_id)
+        ui.flash(t("admin.model_activated", name=escolhido["nome"]))
+        st.rerun()
+    if escolhido is None:
+        c_cap.caption(t("admin.select_model_hint"))
     else:
-        rotulos = {f"{m['nome']}  ·  {m['tipo']}": m for m in modelos}
-        atual_nome = os.path.basename(weights_atual)
-        chaves = list(rotulos.keys())
-        idx = next((i for i, k in enumerate(chaves)
-                    if rotulos[k]["nome"] == atual_nome), 0)
-        sel_rot = st.selectbox("Pesos em uso", chaves, index=idx, key="admin_modelo")
-        st.caption(f"Ativo agora: **{atual_nome}**. Trocar recarrega o modelo "
-                   "para você comparar os resultados (Darknet = modelo original; "
-                   "Ultralytics = modelos `.pt` treinados no app).")
-        if st.button("Aplicar modelo", type="primary", key="admin_aplicar_modelo"):
-            m = rotulos[sel_rot]
-            sel = m["nome"]
-            database.set_setting("active_weights", m["weights"])
-            database.set_setting("active_cfg", m["cfg"])
-            carregar_modelo.clear()   # invalida o cache p/ recarregar os novos pesos
-            log_event("model_selected", f"Modelo ativo: {sel}",
-                      user_id=current_user_id)
-            st.success(f"Modelo **{sel}** ativado. Recarregando…")
-            st.rerun()
+        c_cap.caption(t("admin.active_model_caption", name=_md_esc(atual_nome)))
 
     # --- Comparar modelos (em conjunto rotulado) ---
-    st.markdown("---")
-    st.markdown("#### 🆚 Comparar modelos")
-    itens = itens_avaliacao(current_user_id)
-    if not itens:
-        st.info("Para comparar, é preciso um conjunto rotulado: anote candidatos "
-                "(aba *🏷️ Anotação*) e/ou importe um dataset externo com rótulos.")
-    elif not modelos:
-        st.info("Nenhum modelo disponível para comparar.")
-    else:
-        st.caption(f"Avalia cada modelo em **{len(itens)} imagem(ns) rotulada(s)** "
-                   "(reanotadas + externas), casando detecções ao ground-truth por "
-                   "IoU ≥ 0,5. Maior **F1** = melhor equilíbrio entre acertar e não "
-                   "inventar. Útil para escolher qual ativar acima.")
-        conf_aval = st.slider("Confiança da avaliação", 0.1, 0.9, 0.4, 0.05,
-                              key="admin_aval_conf")
-        if st.button("Avaliar todos os modelos", key="admin_avaliar"):
+    st.divider()
+    st.markdown(t("admin.compare_title"))
+    cont = database.candidate_counts(current_user_id)
+    n_rot = cont.get("anotado", 0) + cont.get("sem_abelha", 0) + contar_externo()[0]
+    if n_rot == 0:
+        st.info(t("admin.compare_need_labels"))
+        return
+    st.caption(t("admin.compare_caption", n=min(n_rot, LIMITE_AVALIACAO)))
+    st.caption(t("admin.compare_train_overlap"))
+    conf_aval = st.slider(t("admin.eval_confidence"), 0.1, 0.9, 0.4, 0.05,
+                          key="admin_aval_conf", help=t("admin.eval_confidence_help"))
+    avaliar = st.button(t("admin.evaluate_all"), key="admin_avaliar",
+                        on_click=_marcar_ocupado)
+    st.caption(t("admin.eval_keep_page_open"))
+    if avaliar:
+        with _tarefa_longa():
             id_alvo = (class_names.index(TARGET_CLASS)
                        if class_names and TARGET_CLASS in class_names else 0)
             linhas = []
-            prog = st.progress(0.0)
-            for i, m in enumerate(modelos):
-                try:
-                    mdl, _, _ = carregar_modelo(input_size, usar_gpu, fp16,
-                                                m["cfg"], m["weights"])
-                    met = avaliar_modelo(mdl, itens, conf_aval, nms, id_alvo)
-                    linhas.append({
-                        "Modelo": m["nome"], "Tipo": m["tipo"],
-                        "Precisão": round(met["precisao"], 3),
-                        "Recall": round(met["recall"], 3),
-                        "F1": round(met["f1"], 3),
-                        "IoU médio": round(met["iou_medio"], 3),
-                        "TP": met["tp"], "FP": met["fp"], "FN": met["fn"],
-                    })
-                except Exception as e:
-                    linhas.append({"Modelo": m["nome"], "Tipo": m["tipo"],
-                                   "F1": None, "Precisão": f"erro: {e}"})
-                prog.progress((i + 1) / len(modelos))
-            prog.empty()
-            df_cmp = pd.DataFrame(linhas).sort_values(
-                "F1", ascending=False, na_position="last")
-            st.session_state["cmp_modelos"] = df_cmp
-            log_event("models_compared", f"Comparados {len(modelos)} modelos",
-                      user_id=current_user_id)
-        if st.session_state.get("cmp_modelos") is not None:
-            df_cmp = st.session_state["cmp_modelos"]
-            st.dataframe(df_cmp, hide_index=True, width="stretch")
-            validos = df_cmp.dropna(subset=["F1"]) if "F1" in df_cmp else df_cmp
-            if len(validos):
-                melhor = validos.iloc[0]
-                st.success(f"🏆 Melhor F1: **{melhor['Modelo']}** "
-                           f"(F1={melhor['F1']}). Selecione-o acima e *Aplicar modelo*.")
+            with st.status(t("admin.evaluating"), expanded=True) as caixa:
+                st.write(t("admin.loading_eval_images"))
+                itens = itens_avaliacao(current_user_id, limite=LIMITE_AVALIACAO)
+                if not itens:
+                    caixa.update(label=t("admin.compare_need_labels_short"), state="error")
+                    ui.flash(t("admin.compare_need_labels_short"), "warning")
+                else:
+                    prog = st.progress(0.0)
+                    for i, m in enumerate(modelos):
+                        prog.progress(i / len(modelos),
+                                      text=t("admin.evaluating_model", name=m["nome"],
+                                             i=i + 1, n=len(modelos)))
+                        linha = {"model": m["nome"], "type": _tipo_modelo(m),
+                                 "precision": None, "recall": None, "f1": None,
+                                 "iou_mean": None, "tp": None, "fp": None, "fn": None,
+                                 "error": None}
+                        try:
+                            mdl, backend_m, erro_m = carregar_modelo(
+                                input_size, usar_gpu, fp16, m["cfg"], m["weights"])
+                            # .pt que não carregou cai p/ o Darknet padrão: não
+                            # avaliar o modelo errado com o nome deste.
+                            if mdl is None or (str(m["weights"]).endswith(".pt") and
+                                               not str(backend_m).startswith("Ultralytics")):
+                                raise RuntimeError(texto_erro_carga(erro_m) if erro_m
+                                                   else t("admin.cmp_load_failed"))
+                            met = avaliar_modelo(mdl, itens, conf_aval, nms, id_alvo)
+                            linha.update({
+                                "precision": round(met["precisao"], 3),
+                                "recall": round(met["recall"], 3),
+                                "f1": round(met["f1"], 3),
+                                "iou_mean": round(met["iou_medio"], 3),
+                                "tp": met["tp"], "fp": met["fp"], "fn": met["fn"],
+                            })
+                        except Exception as e:
+                            linha["error"] = (str(e).strip().splitlines() or [repr(e)])[-1][:160]
+                        linhas.append(linha)
+                    prog.empty()
+                    caixa.update(label=t("admin.evaluation_done", n=len(itens)),
+                                 state="complete", expanded=False)
+            if linhas:
+                df_cmp = pd.DataFrame(linhas).sort_values(
+                    "f1", ascending=False, na_position="last")
+                st.session_state["admin_cmp"] = {"df": df_cmp, "n": len(itens),
+                                                 "conf": conf_aval}
+                log_event("models_compared", f"Comparados {len(modelos)} modelos",
+                          user_id=current_user_id)
+
+    cmp_res = st.session_state.get("admin_cmp")
+    if not (isinstance(cmp_res, dict) and isinstance(cmp_res.get("df"), pd.DataFrame)):
+        return
+    df_cmp = cmp_res["df"].copy()
+    df_cmp["type"] = df_cmp["type"].map(lambda c: t(f"admin.mtype_{c}"))
+    st.caption(t("admin.cmp_result_caption", n=cmp_res["n"], conf=cmp_res["conf"]))
+    colunas = ["model", "type", "f1", "precision", "recall", "tp", "fp", "fn",
+               "iou_mean"]
+    if df_cmp["error"].notna().any():
+        colunas.append("error")
+    _pct = dict(min_value=0.0, max_value=1.0, format="%.2f")
+    st.dataframe(df_cmp, hide_index=True, width="stretch", column_order=colunas,
+                 column_config={
+                     "model": st.column_config.TextColumn(t("admin.col_model")),
+                     "type": st.column_config.TextColumn(t("admin.col_type")),
+                     "f1": st.column_config.ProgressColumn(
+                         t("admin.col_f1"), help=t("admin.help_f1"), **_pct),
+                     "precision": st.column_config.ProgressColumn(
+                         t("admin.col_precision"), help=t("admin.help_precision"), **_pct),
+                     "recall": st.column_config.ProgressColumn(
+                         t("admin.col_recall"), help=t("admin.help_recall"), **_pct),
+                     "tp": st.column_config.NumberColumn(t("admin.col_tp"),
+                                                         help=t("admin.help_tp")),
+                     "fp": st.column_config.NumberColumn(t("admin.col_fp"),
+                                                         help=t("admin.help_fp")),
+                     "fn": st.column_config.NumberColumn(t("admin.col_fn"),
+                                                         help=t("admin.help_fn")),
+                     "iou_mean": st.column_config.NumberColumn(
+                         t("admin.col_iou_mean"), help=t("admin.help_iou"),
+                         format="%.2f"),
+                     "error": st.column_config.TextColumn(t("admin.col_error")),
+                 })
+    validos = df_cmp.dropna(subset=["f1"])
+    if len(validos):
+        melhor = validos.iloc[0]
+        st.success(t("admin.best_f1", model=_md_esc(melhor["model"]),
+                     f1=f"{melhor['f1']:.2f}"))
+
+
+# --- Navegação (só a tela ativa é executada) ---
+
+PAGINAS = ("new", "history", "review", "annotate", "admin")
+
+
+def _rotulos_pagina() -> dict:
+    return {
+        "new": t("sidebar.tab_new_analysis"), "history": t("sidebar.tab_my_analyses"),
+        "review": t("sidebar.tab_review"), "annotate": t("sidebar.tab_annotation"),
+        "admin": t("sidebar.tab_admin"),
+    }
+
+
+# --- Trabalhos longos x navegação ---
+# A navegação e o idioma são widgets do servidor: clicar neles durante um
+# processamento faz o Streamlit interromper a execução (nada seria salvo).
+# Botões que disparam trabalhos longos marcam a sessão como ocupada num
+# on_click — que roda ANTES do script —, então a navegação e o idioma,
+# desenhados antes do botão, já saem desabilitados nessa mesma execução.
+_OCUPADO = "_tarefa_em_andamento"
+
+
+def _marcar_ocupado():
+    st.session_state[_OCUPADO] = True
+
+
+def _ocupado() -> bool:
+    return bool(st.session_state.get(_OCUPADO))
+
+
+@contextmanager
+def _tarefa_longa():
+    """Envolve um trabalho longo disparado por botão com on_click=_marcar_ocupado.
+
+    Ao terminar, libera a sessão e redesenha a página (a navegação desta
+    execução foi desenhada desabilitada). Quem usa deve guardar em
+    session_state tudo o que precisa continuar visível após o redesenho.
+    """
+    try:
+        yield
+    finally:
+        st.session_state.pop(_OCUPADO, None)
+    st.rerun()
+
+
+def go_to(page: str):
+    """Vai para outra tela (new/history/review/annotate/admin) e redesenha.
+
+    O valor vai para uma chave pendente porque o seletor de navegação (widget
+    "nav_page") já foi desenhado nesta execução e não pode ser alterado depois;
+    render_navegacao() aplica o pedido no início da próxima execução.
+    """
+    if page not in PAGINAS:
+        return
+    st.session_state["_nav_goto"] = page
+    st.query_params["page"] = page
+    st.rerun()
+
+
+def _ao_mudar_pagina():
+    pagina = st.session_state.get("nav_page")
+    if pagina is None:   # clique na opção já ativa: mantém a tela atual
+        st.session_state["nav_page"] = st.session_state.get("_nav_last", "new")
+
+
+def render_navegacao(is_admin: bool) -> str:
+    """Navegação superior; devolve a tela ativa e a mantém em ?page= na URL."""
+    paginas = [p for p in PAGINAS if p != "admin" or is_admin]
+    pendente = st.session_state.pop("_nav_goto", None)
+    if pendente in paginas:
+        st.session_state["nav_page"] = pendente
+    if st.session_state.get("nav_page") not in paginas:
+        # 1º carregamento (ou link direto): ?page= da URL; senão a última tela.
+        q = st.query_params.get("page")
+        ultima = st.session_state.get("_nav_last")
+        st.session_state["nav_page"] = (q if q in paginas else
+                                        ultima if ultima in paginas else "new")
+    rotulos = _rotulos_pagina()
+    pagina = st.segmented_control(
+        t("nav.label"), paginas, key="nav_page", required=True,
+        format_func=lambda p: rotulos.get(p, p),
+        label_visibility="collapsed", on_change=_ao_mudar_pagina,
+        disabled=_ocupado(),   # trocar de tela interromperia o processamento
+    )
+    if pagina not in paginas:
+        pagina = st.session_state.get("_nav_last", "new")
+    st.session_state["_nav_last"] = pagina
+    if st.query_params.get("page") != pagina:
+        st.query_params["page"] = pagina
+    return pagina
+
+
+def gpu_disponivel(modelo_pt: bool) -> tuple[bool, str]:
+    """(há GPU utilizável?, como foi verificado: "torch" ou "opencv").
+
+    Modelos Darknet (.weights) rodam no OpenCV DNN, que precisa de OpenCV
+    compilado com CUDA; modelos Ultralytics (.pt) rodam no PyTorch, que tem o
+    próprio suporte a CUDA — por isso a verificação depende do modelo ativo.
+    """
+    if modelo_pt:
+        try:
+            import torch
+            return bool(torch.cuda.is_available()), "torch"
+        except Exception:
+            return False, "torch"
+    return cuda_disponivel(), "opencv"
+
+
+def modelo_utilizavel(cfg: str, weights: str) -> bool:
+    if str(weights).endswith(".pt"):
+        return os.path.exists(weights)
+    return os.path.exists(cfg) and os.path.exists(weights)
+
+
+def _sair(user_id, username):
+    log_event("logout", f"Logout de '{username}'", user_id=user_id)
+    _descartar_video_atual()
+    st.session_state.clear()
+    st.rerun()
+
+
+def render_conta(user_id, username, is_admin):
+    """Linha compacta da conta: usuário + papel e um menu (senha / sair)."""
+    papel = (ui.chip(t("sidebar.role_admin"), "admin") if is_admin
+             else ui.chip(t("sidebar.role_user"), "info"))
+    c_user, c_menu = st.columns([1, 1], vertical_alignment="center")
+    c_user.markdown(f"👤 **{ui.esc(username)}**<br>{papel}", unsafe_allow_html=True)
+    with c_menu.popover(t("sidebar.my_account"), icon=":material/manage_accounts:",
+                        width="stretch"):
+        with st.form("form_trocar_senha", clear_on_submit=True):
+            st.markdown(t("sidebar.change_password_title"))
+            p_atual = st.text_input(t("sidebar.current_password"), type="password")
+            p_nova = st.text_input(t("sidebar.new_password"), type="password")
+            p_conf = st.text_input(t("sidebar.confirm_password"), type="password")
+            if st.form_submit_button(t("sidebar.change_password"), width="stretch"):
+                if p_nova != p_conf:
+                    st.error(t("sidebar.passwords_mismatch"))
+                else:
+                    ok, msg = auth.change_password(user_id, p_atual, p_nova)
+                    if ok:
+                        ui.flash(msg)
+                        st.rerun()
+                    st.error(msg)
+        if st.button(t("sidebar.logout"), width="stretch", icon=":material/logout:"):
+            _sair(user_id, username)
+
+
+def render_hardware_status(info, tem_cuda, via, usar_gpu, backend, erro_cuda,
+                           weights_ativo):
+    """Explica em linguagem simples onde o processamento roda (GPU/CPU)."""
+    with info:
+        if not tem_cuda:
+            st.caption(t("sidebar.no_gpu_plain", skip_label=t("sidebar.frame_skip")))
+        elif "fallback" in backend:   # CUDA falhou no warm-up -> CPU
+            st.caption(t("sidebar.gpu_failed_plain"))
+        elif usar_gpu:
+            st.caption(t("sidebar.gpu_ready"))
+        else:
+            st.caption(t("sidebar.gpu_off"))
+        with st.expander(t("sidebar.tech_details"), expanded=False):
+            resultado = t("sidebar.tech_yes") if tem_cuda else t("sidebar.tech_no")
+            if via == "torch":
+                st.caption(t("sidebar.tech_check_torch", result=resultado))
+            else:
+                st.caption(t("sidebar.tech_check_opencv", result=resultado))
+            st.caption(t("sidebar.backend_in_use", backend=rotulo_backend(backend)))
+            st.caption(t("sidebar.active_model", model=os.path.basename(weights_ativo)))
+            st.caption(t("sidebar.target_class", cls=TARGET_CLASS))
+            tipo_erro = getattr(erro_cuda, "tipo", None)
+            if tipo_erro == "cuda":       # o backend caiu de fato para a CPU
+                st.caption(t("sidebar.cpu_fallback_reason", error=erro_cuda))
+            elif tipo_erro == "model":    # o .pt não carregou; usa o Darknet padrão
+                st.caption(t("sidebar.model_fallback_reason",
+                             error=texto_erro_carga(erro_cuda)))
+            elif erro_cuda:               # nenhum modelo pôde ser carregado
+                st.caption(t("sidebar.model_load_failed_reason", error=erro_cuda))
+            if tipo_erro == "cuda" and "CUDA_ARCH" in erro_cuda:
+                st.caption(t("sidebar.cuda_arch_mismatch"))
+            elif not tem_cuda and via == "opencv":
+                st.caption(t("sidebar.tech_no_cuda_hint"))
+
+
+def chips_cabecalho(nome_modelo, backend, model_ok):
+    """Chips do cabeçalho: arquivo do modelo ativo e onde ele está rodando."""
+    if not model_ok:
+        return ui.chip(t("nav.chip_no_model"), "warn")
+    if "GPU" in backend:
+        b = ui.chip(t("nav.chip_gpu"), "ok")
+    elif "fallback" in backend:
+        b = ui.chip(t("nav.chip_cpu_fallback"), "warn")
+    else:
+        b = ui.chip(t("nav.chip_cpu"), "warn")
+    return ui.chip("🧠 " + ui.esc(nome_modelo), "info") + b
 
 
 # --- Fluxo principal ---
+
+ui.show_flash()
 
 if "user_id" not in st.session_state:
     tela_login()
@@ -2491,165 +3945,127 @@ ui.inject_css()
 role = st.session_state.get("role", "user")
 is_admin = role == "admin"
 
-if not (os.path.exists(YOLO_CFG) and os.path.exists(YOLO_WEIGHTS)):
-    st.error(
-        f"Arquivos YOLO não encontrados! Certifique-se de que '{YOLO_CFG}' e "
-        f"'{YOLO_WEIGHTS}' estão no diretório da aplicação."
-    )
-    st.stop()
+cfg_ativo, weights_ativo = modelo_ativo()
+modelo_pt = str(weights_ativo).endswith(".pt")
+tem_cuda, via_cuda = gpu_disponivel(modelo_pt)
 
 with st.sidebar:
-    st.markdown(f"👤 **{username}**")
-    st.markdown(ui.chip("Administrador", "admin") if is_admin
-                else ui.chip("Conta comum", "info"), unsafe_allow_html=True)
-    with st.expander("🔒 Minha conta"):
-        with st.form("form_trocar_senha", clear_on_submit=True):
-            p_atual = st.text_input("Senha atual", type="password")
-            p_nova = st.text_input("Nova senha", type="password")
-            p_conf = st.text_input("Confirmar nova senha", type="password")
-            if st.form_submit_button("Trocar senha", width="stretch"):
-                if p_nova != p_conf:
-                    st.error("As senhas não conferem.")
-                else:
-                    ok, msg = auth.change_password(user_id, p_atual, p_nova)
-                    (st.success if ok else st.error)(msg)
-    if st.button("Sair", width="stretch"):
-        log_event("logout", f"Logout de '{username}'", user_id=user_id)
-        caminho = st.session_state.pop("video_path", None)
-        if caminho and os.path.exists(caminho):
-            try:
-                os.remove(caminho)
-            except OSError:
-                pass
-        st.session_state.clear()
-        st.rerun()
+    i18n.language_selector(disabled=_ocupado())
+    render_conta(user_id, username, is_admin)
 
     st.markdown("---")
-    st.header("⚙️ Configurações")
-    tem_cuda = cuda_disponivel()
+    st.header(t("sidebar.settings"))
 
-    with st.expander("🖥️ Hardware / aceleração", expanded=False):
-        usar_gpu = st.toggle(
-            "Usar GPU (CUDA)", value=tem_cuda, disabled=not tem_cuda,
-            help="Disponível apenas com OpenCV compilado com CUDA (imagem Docker GPU).",
-        )
-        fp16 = st.toggle(
-            "Precisão FP16 na GPU", value=usar_gpu, disabled=not usar_gpu,
-            help="~2x mais rápido em GPUs com Tensor Cores; precisão praticamente igual.",
-        )
-        if not tem_cuda:
-            st.caption("GPU indisponível: OpenCV sem suporte CUDA neste ambiente.")
-
-    with st.expander("🔍 Detecção", expanded=True):
+    with st.expander(t("sidebar.detection"), expanded=True):
         input_size = st.select_slider(
-            "Resolução de entrada da rede", options=[320, 416, 512], value=416,
-            help="320 é mais rápido; 512 detecta melhor objetos pequenos.",
+            t("sidebar.input_size"), options=[320, 416, 512], value=416,
+            help=t("sidebar.input_size_help"), key="cfg_input_size",
         )
-        frame_skip = st.slider("Processar 1 a cada N frames", 1, 10, 10)
-        conf = st.slider("Limiar de confiança", 0.1, 0.9, 0.4, 0.05)
-        nms = st.slider("Limiar NMS", 0.1, 0.9, 0.3, 0.05)
+        frame_skip = st.slider(t("sidebar.frame_skip"), 1, 10, 10, key="cfg_frame_skip")
+        conf = st.slider(t("sidebar.conf_threshold"), 0.1, 0.9, 0.4, 0.05,
+                         key="cfg_conf")
+        nms = st.slider(t("sidebar.nms_threshold"), 0.1, 0.9, 0.3, 0.05, key="cfg_nms")
         ampliar_areas = st.checkbox(
-            "🔍 Detecção por recorte das áreas (crop)", value=True,
-            help="Quando há áreas definidas: recorta cada área (com uma folga "
-                 "lateral, como no recorte do resultado por área) e passa SÓ o "
-                 "recorte pela rede — a abelha ocupa muito mais pixels, melhorando "
-                 "a detecção em vídeos de baixa resolução. Considera apenas as "
-                 "áreas delimitadas; se a abelha de uma placa adjacente aparecer "
-                 "na folga, é descartada como falso positivo (o centro precisa "
-                 "estar dentro desta área e fora das vizinhas). Sem áreas "
-                 "definidas, não tem efeito. Mais lento (uma detecção por área "
-                 "por frame) e requer reprocessar o vídeo.",
+            t("sidebar.crop_detection"), value=True,
+            help=t("sidebar.crop_detection_help"), key="cfg_ampliar",
         )
         gerar_video = st.checkbox(
-            "Gerar vídeo de conferência das detecções", value=True,
-            help="Cria um MP4 com as detecções desenhadas nos frames processados "
-                 "(🟧 áreas · 🟨 detecções brutas do YOLO com confiança · 🟩 detecção "
-                 "aceita/rastreada), exibido na aba '🎬 Conferência'. Ajuda a ajustar "
-                 "os parâmetros. Aumenta um pouco o tempo de processamento.",
+            t("sidebar.review_video"), value=True,
+            help=t("sidebar.review_video_help"), key="cfg_gerar_video",
         )
         coletar_candidatos = st.checkbox(
-            "🏷️ Coletar candidatos para reanotação", value=False,
-            help="Durante o processamento, amostra frames cuja melhor detecção "
-                 "fique fraca (abaixo do limiar de revisão) ou ausente e guarda-os "
-                 "para reanotar na aba '🏷️ Anotação' — base do dataset de "
-                 "fine-tuning.",
+            t("sidebar.collect_candidates"), value=False,
+            help=t("sidebar.collect_candidates_help"), key="cfg_coletar",
         )
         limiar_revisao = st.slider(
-            "Limiar de revisão (confiança)", 0.1, 0.9, 0.5, 0.05,
+            t("sidebar.review_threshold"), 0.1, 0.9, 0.5, 0.05,
             disabled=not coletar_candidatos,
-            help="Frames cuja melhor detecção fique ABAIXO deste valor (ou sem "
-                 "detecção) viram candidatos para reanotação.",
+            help=t("sidebar.review_threshold_help"), key="cfg_limiar_revisao",
         )
 
-    with st.expander("📊 Rastreamento e áreas", expanded=True):
+    with st.expander(t("sidebar.tracking_areas"), expanded=True):
         zonas_def = st.session_state.get("zones") or []
         if zonas_def:
             # Com áreas definidas, cada área é uma placa: o nº é determinado por elas
             # (um único valor manda). Não faz sentido pedir o número manualmente.
             num_placas = len(zonas_def)
-            st.info(f"🎯 **{num_placas} área(s) definida(s)**: cada área é uma placa, "
-                    "então o número de placas vem das áreas. Limpe as áreas (aba *Nova "
-                    "Análise*) para definir o número manualmente.")
+            st.info(t("sidebar.zones_defined_info", n=num_placas))
         else:
             num_placas = st.number_input(
-                "Número de placas (abelhas por frame)", min_value=1, max_value=12, value=1,
-                help="Mantém as N detecções de maior confiança em cada frame e rastreia "
-                     "cada uma como uma placa/abelha separada. Use quando há várias placas "
-                     "no mesmo vídeo. Requer reprocessar o vídeo.",
+                t("sidebar.num_dishes"), min_value=1, max_value=12, value=1,
+                help=t("sidebar.num_dishes_help"), key="cfg_num_placas",
             )
         limiar_parada_px = st.slider(
-            "Limiar de parada (px entre amostras)", 0, 50, 3,
-            help="Deslocamentos menores que isto contam como 'parada' nas métricas "
-                 "de tempo em movimento. Ajuste conforme a escala do vídeo. "
-                 "Não exige reprocessar — recalcula na hora.",
+            t("sidebar.stop_threshold"), 0, 50, 3,
+            help=t("sidebar.stop_threshold_help"), key="cfg_limiar_parada",
         )
 
-    with st.expander("📈 Gráficos exibidos", expanded=False):
-        st.caption("Escolha quais gráficos opcionais aparecem nos resultados "
-                   "(efeito imediato, sem reprocessar).")
-        st.checkbox("Posição X / Y ao longo do tempo", value=True, key="graf_posicao")
-        st.checkbox("Velocidade instantânea", value=True, key="graf_velocidade")
-        st.checkbox("Distribuição de velocidades", value=True, key="graf_histograma")
+    with st.expander(t("sidebar.hardware"), expanded=False):
+        # Toggles com key ignoram `value=` depois de criados. A disponibilidade
+        # de GPU depende do modelo ativo (torch p/ .pt, OpenCV p/ .weights) e
+        # pode mudar na sessão: nesse caso, volta ao padrão (GPU/FP16 ligados
+        # quando há GPU).
+        if st.session_state.get("_hw_tem_cuda") != tem_cuda:
+            st.session_state["_hw_tem_cuda"] = tem_cuda
+            st.session_state["cfg_usar_gpu"] = tem_cuda
+            st.session_state["cfg_fp16"] = tem_cuda
+        for _k in ("cfg_usar_gpu", "cfg_fp16"):
+            st.session_state.setdefault(_k, tem_cuda)
+        usar_gpu = st.toggle(   # valor inicial vem da sessão (acima)
+            t("sidebar.use_gpu"), disabled=not tem_cuda,
+            help=t("sidebar.use_gpu_help"), key="cfg_usar_gpu",
+        ) and tem_cuda
+        fp16 = st.toggle(
+            t("sidebar.fp16"), disabled=not usar_gpu,
+            help=t("sidebar.fp16_help"), key="cfg_fp16",
+        ) and usar_gpu
+        hw_info = st.container()
 
 class_names = carregar_classes()
-cfg_ativo, weights_ativo = modelo_ativo()
-model, backend, erro_cuda = carregar_modelo(input_size, usar_gpu, fp16,
-                                            cfg_ativo, weights_ativo)
-st.sidebar.markdown("---")
-st.sidebar.info(f"Backend em uso: **{backend}**")
-st.sidebar.caption(f"🧠 Modelo: **{os.path.basename(weights_ativo)}**")
-if erro_cuda:
-    st.sidebar.error(f"Motivo do fallback para CPU: {erro_cuda}")
-    if "CUDA_ARCH" in erro_cuda:
-        st.sidebar.warning(
-            "A imagem foi compilada para outra arquitetura de GPU. "
-            "Reconstrua com `--build-arg CUDA_ARCH_BIN=\"<compute capability "
-            "da sua placa>\"` (veja `nvidia-smi --query-gpu=compute_cap "
-            "--format=csv`)."
-        )
-st.sidebar.info(f"Classe alvo: **'{TARGET_CLASS}'**")
-st.sidebar.caption("🌗 Tema **escuro** por padrão — para alternar para o claro, "
-                   "use o menu **⋮** (canto superior direito) → *Settings* → *Theme*.")
+model, backend, erro_cuda = None, "—", None
+if modelo_utilizavel(cfg_ativo, weights_ativo):
+    try:
+        model, backend, erro_cuda = carregar_modelo(input_size, usar_gpu, fp16,
+                                                    cfg_ativo, weights_ativo)
+    except Exception as e:   # ex.: .pt falhou e o Darknet padrão não existe
+        erro_cuda = str(e).strip().splitlines()[-1] if str(e) else repr(e)
+        log_event("model_load_failed", erro_cuda, level=logging.ERROR)
+# Se o .pt não carregou, carregar_modelo cai para o Darknet padrão.
+em_uso = (YOLO_WEIGHTS if modelo_pt and model is not None
+          and not backend.startswith("Ultralytics") else weights_ativo)
+render_hardware_status(hw_info, tem_cuda, via_cuda, usar_gpu, backend, erro_cuda,
+                       em_uso)
 
-ui.header("Detecção e Rastreamento de Abelha",
-          "YOLOv4 · áreas de monitoramento · múltiplas placas · relatórios")
+ui.header(t("core.app_name"), t("core.app_subtitle"),
+          aside=chips_cabecalho(os.path.basename(em_uso), backend, model is not None))
+if model is None:
+    st.error(t("core.no_usable_model", weights=weights_ativo,
+               reason=f" ({texto_erro_carga(erro_cuda)})" if erro_cuda else ""))
+elif em_uso != weights_ativo:
+    st.warning(t("core.model_fallback", active=os.path.basename(weights_ativo),
+                 used=os.path.basename(em_uso)))
 
-rotulos_abas = ["📹 Nova Análise", "📊 Minhas Análises", "🎬 Conferência",
-                "🏷️ Anotação"]
-if is_admin:
-    rotulos_abas.append("⚙️ Administração")
-abas = st.tabs(rotulos_abas)
-with abas[0]:
-    render_nova_analise(user_id, model, backend, class_names,
-                        frame_skip, input_size, conf, nms, limiar_parada_px,
-                        num_placas, ampliar_areas, gerar_video,
-                        coletar_candidatos, limiar_revisao)
-with abas[1]:
+pagina = render_navegacao(is_admin)
+
+if pagina == "new":
+    if model is None:
+        st.info(t("core.new_needs_model"))
+    else:
+        render_nova_analise(user_id, model, backend, class_names,
+                            frame_skip, input_size, conf, nms, limiar_parada_px,
+                            num_placas, ampliar_areas, gerar_video,
+                            coletar_candidatos, limiar_revisao,
+                            nome_modelo=os.path.basename(em_uso))
+elif pagina == "history":
     render_historico(user_id, username, limiar_parada_px)
-with abas[2]:
+elif pagina == "review":
     render_conferencia()
-with abas[3]:
+elif pagina == "annotate":
     render_anotacao(user_id)
-if is_admin:
-    with abas[4]:
-        render_admin(user_id, input_size, usar_gpu, fp16, nms, class_names)
+elif pagina == "admin" and is_admin:
+    render_admin(user_id, input_size, usar_gpu, fp16, nms, class_names)
+
+# Rede de segurança: se a sessão ficou marcada como ocupada sem que o trabalho
+# rodasse (ex.: a tela mudou antes do botão), reabilita a navegação.
+if st.session_state.pop(_OCUPADO, None):
+    st.rerun()
