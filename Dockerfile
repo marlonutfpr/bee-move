@@ -24,11 +24,16 @@ ARG OPENCV_VERSION=4.10.0
 # =============================================================================
 # Estágio 1: compilação do OpenCV com CUDA (somente para o alvo GPU)
 # =============================================================================
-FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04 AS gpu-build
+# Ubuntu 24.04 (Python 3.12): o Streamlit >=1.67 exigido pela interface não
+# publica mais versões para o Python 3.10 do Ubuntu 22.04.
+FROM nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04 AS gpu-build
 ARG OPENCV_VERSION
 # Arquiteturas suportadas por padrão (Pascal -> Hopper). Restrinja p/ build mais rápida.
 ARG CUDA_ARCH_BIN="6.1 7.0 7.5 8.0 8.6 8.9 9.0"
-ENV DEBIAN_FRONTEND=noninteractive
+# PEP 668: no Ubuntu 24.04 o pip recusa o Python do sistema; aqui só entra o
+# numpy usado para compilar os bindings do OpenCV.
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_BREAK_SYSTEM_PACKAGES=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake pkg-config wget unzip \
@@ -75,22 +80,33 @@ RUN cmake -S /tmp/opencv-${OPENCV_VERSION} -B /tmp/build \
 # =============================================================================
 # Alvo GPU: runtime CUDA enxuto + OpenCV compilado no estágio anterior
 # =============================================================================
-FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04 AS gpu
+FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04 AS gpu
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 python3-pip ffmpeg libglib2.0-0 \
+        python3 python3-venv ffmpeg libglib2.0-0 libjpeg-turbo8 libpng16-16t64 \
     && rm -rf /var/lib/apt/lists/*
+
+# venv: o pip do Ubuntu 24.04 não instala no Python do sistema (PEP 668). Usa
+# o mesmo Python 3.12 com que o OpenCV foi compilado no estágio anterior.
+RUN python3 -m venv /opt/venv
+ENV VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:${PATH}
 
 COPY --from=gpu-build /opt/opencv /opt/opencv
 ENV PYTHONPATH=/opt/opencv/python \
     LD_LIBRARY_PATH=/opt/opencv/lib:${LD_LIBRARY_PATH}
 
 COPY requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt
+# A ultralytics puxa o opencv-python do pip, que não tem CUDA: removido para que
+# o cv2 importado seja SEMPRE o compilado em /opt/opencv. O torch vem do PyPI
+# com CUDA (a ultralytics usa a GPU para treinar e inferir os modelos .pt).
+RUN pip install --no-cache-dir -r requirements.txt \
+    && (pip uninstall -y opencv-python opencv-python-headless || true) \
+    && python3 -c "import cv2; assert cv2.__file__.startswith('/opt/opencv'), cv2.__file__; assert hasattr(cv2, 'cuda'); cv2.dnn.readNetFromDarknet"
 
 COPY src/ ./src/
 COPY models/ ./models/

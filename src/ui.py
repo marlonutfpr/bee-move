@@ -18,7 +18,11 @@ A API pública é a MESMA de antes — inject_css(), header(title, subtitle),
 chip(text, kind) —, então bee_tracker.py não precisa de mudanças para usar.
 """
 
+import html
+
 import streamlit as st
+
+from i18n import t
 
 PRIMARY = "#E3A43A"
 PRIMARY_DARK = "#C2862A"
@@ -67,7 +71,7 @@ h1, h2, h3 { letter-spacing: -.015em; }
    CABEÇALHO — barra de acento + título (sem gradiente pesado)
    ========================================================= */
 .bee-header {
-  display: flex; align-items: flex-start; gap: 15px;
+  display: flex; align-items: flex-start; gap: 15px; flex-wrap: wrap;
   padding: 2px 0 18px; margin-bottom: 20px;
   border-bottom: 1px solid var(--bee-warm-2);
 }
@@ -82,6 +86,10 @@ h1, h2, h3 { letter-spacing: -.015em; }
 }
 .bee-header .title { margin: 0; font-size: 1.5rem; font-weight: 700; line-height: 1.15; }
 .bee-header .subtitle { margin: .3rem 0 0; opacity: .72; font-size: .92rem; }
+.bee-header .aside {
+  margin-left: auto; align-self: center;
+  display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end;
+}
 
 /* =========================================================
    MÉTRICAS — cartão com filete de acento + valor mono
@@ -185,14 +193,19 @@ def inject_css():
     st.markdown(_CSS, unsafe_allow_html=True)
 
 
-def header(title, subtitle=""):
-    """Cabeçalho com barra de acento + marca hexagonal (favo de mel)."""
+def header(title, subtitle="", aside=""):
+    """Cabeçalho com barra de acento + marca hexagonal (favo de mel).
+
+    `aside`: HTML opcional alinhado à direita (ex.: chips de modelo/backend).
+    """
     sub = f'<div class="subtitle">{subtitle}</div>' if subtitle else ""
+    lado = f'<div class="aside">{aside}</div>' if aside else ""
     st.markdown(
         '<div class="bee-header">'
         '<div class="accent"></div>'
         '<div class="mark"></div>'
         f'<div><div class="title">{title}</div>{sub}</div>'
+        f'{lado}'
         '</div>',
         unsafe_allow_html=True,
     )
@@ -208,6 +221,7 @@ def chip(text, kind="info"):
         "warn":  ("rgba(200,140,40,.18)", "#D89A2E"),
         "info":  ("rgba(70,120,210,.16)", "#5E8BD8"),
         "admin": ("rgba(150,100,210,.16)","#9D7BD8"),
+        "raw":   ("rgba(215,185,30,.18)", "#C9A417"),   # amarelo (detecção bruta)
     }
     bg, fg = cores.get(kind, cores["info"])
     return (f'<span style="background:{bg};color:{fg};padding:3px 11px;'
@@ -216,3 +230,60 @@ def chip(text, kind="info"):
             f'white-space:nowrap;">'
             f'<span style="width:6px;height:6px;border-radius:50%;'
             f'background:currentColor;"></span>{text}</span>')
+
+
+# =========================================================
+# Mensagens que sobrevivem ao st.rerun() (toast) e confirmação
+# =========================================================
+
+_FLASH_KEY = "_flash"
+_FLASH_ICONS = {"success": "✅", "info": "ℹ️", "warning": "⚠️", "error": "❌",
+                "delete": "🗑️"}
+
+
+def flash(msg, kind="success"):
+    """Guarda uma mensagem para mostrar (toast) na PRÓXIMA execução.
+
+    Use antes de st.rerun(): um st.success() seguido de rerun some antes de o
+    usuário ver. `kind`: success, info, warning, error ou delete.
+    """
+    st.session_state.setdefault(_FLASH_KEY, []).append((str(msg), kind))
+
+
+def show_flash():
+    """Mostra (e consome) as mensagens guardadas por flash(). Chamar 1x por execução."""
+    for msg, kind in st.session_state.pop(_FLASH_KEY, None) or []:
+        st.toast(msg, icon=_FLASH_ICONS.get(kind, "✅"))
+
+
+def confirm_delete(title, body_md, on_confirm, done_msg, key):
+    """Abre um diálogo de confirmação para uma exclusão irreversível.
+
+    - `body_md`: markdown dizendo o que será excluído;
+    - `on_confirm()`: executa a exclusão; devolve None se deu certo ou uma
+      mensagem de erro (o diálogo continua aberto e mostra o erro);
+    - `done_msg`: toast mostrado após excluir.
+    Chame na execução em que o botão "Excluir" foi clicado.
+    """
+    @st.dialog(title)
+    def _dialogo():
+        st.markdown(body_md)
+        st.warning(t("common.cannot_undo"))
+        c_cancel, c_ok = st.columns(2)
+        if c_cancel.button(t("common.cancel"), key=f"{key}_cancelar", width="stretch"):
+            st.rerun()
+        if c_ok.button(t("common.delete_permanently"), key=f"{key}_confirmar",
+                       type="primary", width="stretch"):
+            erro = on_confirm()
+            if erro:
+                st.error(erro)
+            else:
+                flash(done_msg, "delete")
+                st.rerun()
+
+    _dialogo()
+
+
+def esc(text):
+    """Escapa texto do usuário/banco antes de ir para HTML (unsafe_allow_html)."""
+    return html.escape(str(text))

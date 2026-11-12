@@ -20,6 +20,8 @@ from matplotlib.collections import LineCollection
 from matplotlib.path import Path as MplPath
 import seaborn as sns
 
+from i18n import t as _t  # alias: `t` é variável local (tempo/track) em várias funções
+
 MAX_KDE_POINTS = 2000  # subamostra os centróides p/ o KDE não dominar o plot
 
 
@@ -166,13 +168,13 @@ def plot_trajetorias_multi(centroides, indices, track_ids, fundo, fps_video,
         if len(c) == 0:
             continue
         cor = cores[i % 10]
-        rotulo = (rotulos or {}).get(t, f"Abelha {t + 1}")
+        rotulo = (rotulos or {}).get(t, _t("metrics.bee_n", n=t + 1))
         ax.plot(c[:, 0], c[:, 1], "-", color=cor, linewidth=1.2, alpha=0.85,
                 marker="o", markersize=2, label=rotulo)
         ax.plot(*c[0], "o", color=cor, markersize=8, markeredgecolor="black")
     if zones:
         _desenhar_zonas(ax, zones)
-    ax.set_title("Trajetórias por placa")
+    ax.set_title(_t("metrics.title_trajectories_by_dish"))
     ax.legend(loc="upper right", fontsize=8)
     fig.tight_layout()
     return fig
@@ -215,7 +217,7 @@ def metricas_por_zona(centroides, indices, fps_video, zones,
 
     resultados = []
     for i, z in enumerate(zones or []):
-        nome = z.get("name") or f"Área {i + 1}"
+        nome = z.get("name") or _t("metrics.zone_n", n=i + 1)
         poly = z.get("points") or []
         dentro = pontos_em_zona(centroides, poly)
         n_dentro = int(dentro.sum())
@@ -254,10 +256,10 @@ def _desenhar_zonas(ax, zones):
         cor = cores[i % 10]
         fechado = np.vstack([poly, poly[0]])
         ax.plot(fechado[:, 0], fechado[:, 1], "-", color=cor, linewidth=2,
-                label=z.get("name") or f"Área {i + 1}")
+                label=z.get("name") or _t("metrics.zone_n", n=i + 1))
         ax.fill(poly[:, 0], poly[:, 1], color=cor, alpha=0.12)
         cx, cy = poly[:, 0].mean(), poly[:, 1].mean()
-        ax.text(cx, cy, z.get("name") or f"Área {i + 1}", color="white",
+        ax.text(cx, cy, z.get("name") or _t("metrics.zone_n", n=i + 1), color="white",
                 fontsize=8, ha="center", va="center", weight="bold",
                 bbox=dict(boxstyle="round,pad=0.2", fc=cor, ec="none", alpha=0.85))
 
@@ -272,7 +274,7 @@ def plot_mapa_zonas(centroides, fundo, zones):
         ax.scatter(centroides[:, 0], centroides[:, 1], s=6, c="white",
                    alpha=0.35, zorder=1)
     _desenhar_zonas(ax, zones)
-    ax.set_title("Áreas de monitoramento")
+    ax.set_title(_t("metrics.title_zones"))
     ax.legend(loc="upper right", fontsize=8)
     fig.tight_layout()
     return fig
@@ -286,17 +288,17 @@ def plot_permanencia_zonas(metricas_zonas):
     tem_tempo = all("tempo_permanencia" in m for m in metricas_zonas)
     if tem_tempo:
         valores = [m["tempo_permanencia"] for m in metricas_zonas]
-        xlabel, fmt = "Permanência (s)", "{:.1f}"
+        xlabel, fmt = _t("metrics.dwell_s"), "{:.1f}"
     else:
         valores = [m["perc_deteccoes"] for m in metricas_zonas]
-        xlabel, fmt = "Permanência (% das detecções)", "{:.1f}%"
+        xlabel, fmt = _t("metrics.dwell_pct"), "{:.1f}%"
 
     fig, ax = plt.subplots(figsize=(7, max(2.5, 0.6 * len(nomes) + 1)))
     cores = plt.cm.tab10(np.linspace(0, 1, 10))[:len(nomes)]
     ax.barh(nomes, valores, color=cores)
     ax.invert_yaxis()
     ax.set_xlabel(xlabel)
-    ax.set_title("Permanência por área")
+    ax.set_title(_t("metrics.title_dwell_by_zone"))
     for i, v in enumerate(valores):
         ax.text(v, i, " " + fmt.format(v), va="center", fontsize=9)
     ax.grid(axis="x", alpha=0.3)
@@ -313,8 +315,8 @@ def _figura_sobre_fundo(fundo):
     ax.set_xlim(0, largura)
     ax.set_ylim(altura, 0)
     ax.set_aspect("equal", adjustable="box")
-    ax.set_xlabel("Posição X (pixels)")
-    ax.set_ylabel("Posição Y (pixels)")
+    ax.set_xlabel(_t("metrics.pos_x_px"))
+    ax.set_ylabel(_t("metrics.pos_y_px"))
     return fig, ax
 
 
@@ -332,15 +334,15 @@ def plot_trajetoria_tempo(centroides, indices, fundo, fps_video, zones=None):
     lc.set_array(s["t"][:-1])
     ax.add_collection(lc)
     cbar = fig.colorbar(lc, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label(f"Tempo ({s['unidade_t']})")
+    cbar.set_label(_t("metrics.time_unit", u=s['unidade_t']))
 
     ax.plot(*centroides[0], "o", color="lime", markersize=10,
-            markeredgecolor="black", label="Início")
+            markeredgecolor="black", label=_t("metrics.start"))
     ax.plot(*centroides[-1], "s", color="red", markersize=10,
-            markeredgecolor="black", label="Fim")
+            markeredgecolor="black", label=_t("metrics.end"))
     if zones:
         _desenhar_zonas(ax, zones)
-    ax.set_title("Trajetória ao longo do tempo")
+    ax.set_title(_t("metrics.title_trajectory_time"))
     ax.legend(loc="upper right", fontsize=8)
     fig.tight_layout()
     return fig
@@ -367,7 +369,7 @@ def plot_heatmap(centroides, fundo, zones=None):
     if zones:
         _desenhar_zonas(ax, zones)
         ax.legend(loc="upper right", fontsize=8)
-    ax.set_title("Mapa de calor das visitas")
+    ax.set_title(_t("metrics.title_heatmap"))
     fig.tight_layout()
     return fig
 
@@ -382,9 +384,9 @@ def plot_area_explorada(centroides, fundo):
     hull = cv2.convexHull(centroides.astype(np.float32)).reshape(-1, 2)
     poligono = np.vstack([hull, hull[0]])
     ax.plot(poligono[:, 0], poligono[:, 1], "-", color="orange", linewidth=2,
-            label="Envoltória convexa")
+            label=_t("metrics.convex_hull"))
     ax.fill(poligono[:, 0], poligono[:, 1], color="orange", alpha=0.15)
-    ax.set_title("Área explorada")
+    ax.set_title(_t("metrics.title_explored_area"))
     ax.legend(loc="upper right")
     fig.tight_layout()
     return fig
@@ -400,10 +402,10 @@ def plot_velocidade_tempo(centroides, indices, fps_video):
     ax.plot(s["t_meio"], s["velocidade"], color="steelblue", linewidth=1, alpha=0.85)
     media = np.nanmean(s["velocidade"])
     ax.axhline(media, color="red", linestyle="--", linewidth=1,
-               label=f"Média: {media:.1f} {s['unidade_v']}")
-    ax.set_xlabel(f"Tempo ({s['unidade_t']})")
-    ax.set_ylabel(f"Velocidade ({s['unidade_v']})")
-    ax.set_title("Velocidade instantânea ao longo do tempo")
+               label=_t("metrics.mean_label", v=float(media), u=s['unidade_v']))
+    ax.set_xlabel(_t("metrics.time_unit", u=s['unidade_t']))
+    ax.set_ylabel(_t("metrics.speed_unit", u=s['unidade_v']))
+    ax.set_title(_t("metrics.title_speed_time"))
     ax.legend()
     ax.grid(alpha=0.3)
     fig.tight_layout()
@@ -417,9 +419,9 @@ def plot_distancia_acumulada(centroides, indices, fps_video):
     fig, ax = plt.subplots(figsize=(6, 3.5))
     ax.plot(s["t"], s["dist_acum"], color="seagreen", linewidth=1.5)
     ax.fill_between(s["t"], s["dist_acum"], alpha=0.2, color="seagreen")
-    ax.set_xlabel(f"Tempo ({s['unidade_t']})")
-    ax.set_ylabel("Distância acumulada (px)")
-    ax.set_title("Distância percorrida acumulada")
+    ax.set_xlabel(_t("metrics.time_unit", u=s['unidade_t']))
+    ax.set_ylabel(_t("metrics.cum_distance_px"))
+    ax.set_title(_t("metrics.title_cum_distance"))
     ax.grid(alpha=0.3)
     fig.tight_layout()
     return fig
@@ -435,10 +437,10 @@ def plot_histograma_velocidade(centroides, indices, fps_video):
     fig, ax = plt.subplots(figsize=(6, 3.5))
     ax.hist(vel, bins=30, color="mediumpurple", edgecolor="white")
     ax.axvline(float(np.median(vel)), color="red", linestyle="--",
-               label=f"Mediana: {np.median(vel):.1f} {s['unidade_v']}")
-    ax.set_xlabel(f"Velocidade ({s['unidade_v']})")
-    ax.set_ylabel("Frequência (nº de passos)")
-    ax.set_title("Distribuição de velocidades")
+               label=_t("metrics.median_label", v=float(np.median(vel)), u=s['unidade_v']))
+    ax.set_xlabel(_t("metrics.speed_unit", u=s['unidade_v']))
+    ax.set_ylabel(_t("metrics.freq_steps"))
+    ax.set_title(_t("metrics.title_speed_dist"))
     ax.legend()
     fig.tight_layout()
     return fig
@@ -452,9 +454,9 @@ def plot_posicao_tempo(centroides, indices, fps_video):
     fig, ax = plt.subplots(figsize=(10, 3.5))
     ax.plot(s["t"], centroides[:, 0], label="X", color="tab:blue")
     ax.plot(s["t"], centroides[:, 1], label="Y", color="tab:orange")
-    ax.set_xlabel(f"Tempo ({s['unidade_t']})")
-    ax.set_ylabel("Posição (pixels)")
-    ax.set_title("Posição X e Y ao longo do tempo")
+    ax.set_xlabel(_t("metrics.time_unit", u=s['unidade_t']))
+    ax.set_ylabel(_t("metrics.position_px"))
+    ax.set_title(_t("metrics.title_position_time"))
     ax.legend()
     ax.grid(alpha=0.3)
     fig.tight_layout()
